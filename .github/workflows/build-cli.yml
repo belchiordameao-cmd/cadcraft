@@ -1,0 +1,19 @@
+name: build-cli
+on:
+  push:
+    branches: [build-*]
+  workflow_dispatch:
+jobs:
+  cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p cadcraft-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-cli
+          path: target/release/cadcraft-cli
+          retention-days: 3
