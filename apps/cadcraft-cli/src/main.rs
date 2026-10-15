@@ -345,8 +345,8 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(),
     Ok(())
 }
 
-/// Gráfica heuristic: a layout whose drawn frame does not match its page setup's paper (it
-/// covers under half of the sheet, or does not fit) was plotted on another paper, chosen at plot
+/// Gráfica heuristic: a layout whose drawn frame covers under half of its page setup's paper
+/// was plotted on another paper, chosen at plot
 /// time and not saved. Its paper becomes the frame's own size: the paper-space objects are
 /// moved to the origin and, for a frame under 100 mm on its short side (drawn in centimetres),
 /// scaled by 10. Only the session's copy changes. Returns the note to print when applied.
@@ -360,8 +360,8 @@ fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
     let mut handles = Vec::new();
     for e in layout.entities.iter() {
         handles.push(e.handle);
-        // Viewport 1 is the paper-space view itself, not something drawn on the sheet.
-        if matches!(&e.kind, EntityKind::Viewport(v) if v.id == 1) || !d.is_visible(e) {
+        // Viewport outlines and no-plot layers are not part of the drawn sheet.
+        if matches!(&e.kind, EntityKind::Viewport(_)) || !d.is_visible(e) || d.layer(&e.common.layer).is_some_and(|l| !l.plot) {
             continue;
         }
         frame = frame.union(&entity_bounds(d, e, 0));
@@ -372,7 +372,9 @@ fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
     }
     let (sw, sh) = (sheet.size.x * sheet.unit_mm, sheet.size.y * sheet.unit_mm);
     let fits = (w <= sw * 1.01 && h <= sh * 1.01) || (w <= sh * 1.01 && h <= sw * 1.01);
-    if fits && w * h >= 0.5 * sw * sh {
+    // A frame larger than the paper is usually several sheets in one layout, each plotted by
+    // window: left alone.
+    if !fits || w * h >= 0.5 * sw * sh {
         return None;
     }
     let k = if w.min(h) < 100.0 { 10.0 } else { 1.0 };
