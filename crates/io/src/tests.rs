@@ -700,6 +700,28 @@ fn join(p: &[(String, String)]) -> String {
 }
 
 #[test]
+fn viewport_view_center_is_relative_to_the_view_target() {
+    let (d, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let at = p[r.clone()].iter().position(|(c, _)| c == "45").unwrap() + r.start + 1;
+    let mut q: Vec<(String, String)> = p[..at].to_vec();
+    q.extend([("17".into(), "1000.0".into()), ("27".into(), "-250.5".into()), ("37".into(), "0.0".into())]);
+    q.extend(p[at..].iter().cloned());
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    let center = |d: &Drawing| {
+        d.layouts
+            .iter()
+            .flat_map(|l| l.entities.iter())
+            .find_map(|e| match &e.kind {
+                EntityKind::Viewport(v) if v.id == 2 => Some(v.view_center),
+                _ => None,
+            })
+            .expect("viewport")
+    };
+    assert!(center(&back).near(center(&d) + Vec2::new(1000.0, -250.5), 1e-9));
+}
+
+#[test]
 fn viewport_frozen_layers_written_as_341_handles() {
     let (_, p) = frozen_vp_dxf();
     let r = vp_record(&p, "2");
