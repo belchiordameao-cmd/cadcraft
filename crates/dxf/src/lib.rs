@@ -263,7 +263,10 @@ pub fn parse_ascii(text: &str) -> Result<Vec<Tag>> {
 
 #[allow(clippy::while_let_loop)]
 fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
-    let mut tags = Vec::new();
+    // One tag per two lines. Sized up front: growing by doubling holds the old and the new buffer
+    // at once, which for a drawing of tens of millions of tags is gigabytes.
+    let lines = text.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let mut tags = Vec::with_capacity((lines / 2 + 1).min(max_tags.saturating_add(1)));
     let mut lines = text.lines().enumerate();
     loop {
         let Some((ln, code_line)) = lines.next() else { break };
