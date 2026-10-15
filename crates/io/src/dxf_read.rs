@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::*;
-use cadcraft_dxf::{Tag, records, sections};
+use cadcraft_dxf::{Tag, records};
 use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
@@ -1648,8 +1648,13 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
-    let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
-    let secs = sections(&tags);
+    read_tags(cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?)
+}
+
+/// [`read`] from parsed tags, which it consumes.
+pub fn read_tags(tags: Vec<Tag>) -> Result<Drawing> {
+    let outside = outside_sections(&tags);
+    let secs = cadcraft_dxf::into_sections(tags);
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
@@ -1672,7 +1677,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         }
     }
     let mut skipped = std::collections::BTreeMap::new();
-    count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
+    count_skipped(&mut skipped, "(no section)", outside);
     for s in &secs {
         match s.name.as_str() {
             "HEADER" => header(&s.tags, &mut d),
