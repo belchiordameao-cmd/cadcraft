@@ -811,7 +811,11 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         }
         // Raster images with relative paths are found next to the drawing.
         if !o.contains_key("imageDir")
-            && let Some(dir) = s.state().ok().and_then(|st| st.path.clone()).and_then(|f| std::path::Path::new(&f).parent().map(|d| d.to_string_lossy().into_owned()))
+            && let Some(dir) = s
+                .state()
+                .ok()
+                .and_then(|st| st.path.clone())
+                .and_then(|f| std::path::Path::new(&f).parent().map(|d| d.to_string_lossy().into_owned()))
         {
             o.insert("imageDir".into(), json!(if dir.is_empty() { ".".to_string() } else { dir }));
         }

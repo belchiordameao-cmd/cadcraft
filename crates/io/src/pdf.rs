@@ -677,7 +677,7 @@ fn content_stream(
         if let Some((n, img)) = u32::try_from(i).ok().and_then(|i| images.get(&i)) {
             flush(&mut c, &mut pending);
             image(&mut c, *n, img, map);
-            skip = cadcraft_render::PlotImage::PRIMS - 1;
+            skip = img.prims.saturating_sub(1);
             continue;
         }
         let w = f64::from(p.lw) * PT_PER_MM;
@@ -782,12 +782,14 @@ fn content_stream(
 /// Draw image XObject `/Im<n>` over the unit square mapped onto `img`, clipped to its boundary.
 fn image(c: &mut String, n: usize, img: &cadcraft_render::PlotImage, map: &Map) {
     c.push_str("q\n");
-    if img.clip.len() >= 3 {
-        for (i, q) in img.clip.iter().enumerate() {
-            pt(c, map.pt(*q));
-            c.push_str(if i == 0 { " m\n" } else { " l\n" });
+    for outline in [&img.viewport, &img.clip] {
+        if outline.len() >= 3 {
+            for (i, q) in outline.iter().enumerate() {
+                pt(c, map.pt(*q));
+                c.push_str(if i == 0 { " m\n" } else { " l\n" });
+            }
+            c.push_str("h W n\n");
         }
-        c.push_str("h W n\n");
     }
     let o = map.pt(img.origin);
     let u = map.pt(img.origin + img.u) - o;
@@ -845,7 +847,11 @@ fn image_object(objs: &mut Objects, path: &str, dir: Option<&str>, compress: boo
         }
         let dict = format!(" /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8");
         let smask = if alpha.iter().any(|a| *a < 255) {
-            let m = objs.add(stream(&alpha, compress, &format!(" /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8")));
+            let m = objs.add(stream(
+                &alpha,
+                compress,
+                &format!(" /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8"),
+            ));
             format!(" /SMask {m} 0 R")
         } else {
             String::new()

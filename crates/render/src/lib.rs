@@ -90,8 +90,7 @@ pub struct DisplayList {
     /// filled outline primitive they stand for ([`PlotText::prim`]), in drawing order.
     pub texts: Vec<PlotText>,
     /// Plots: raster images drawn as their placeholder (frame and diagonals), so output that can
-    /// place the picture draws it instead of those primitives. Images seen through a viewport
-    /// are not listed (they keep the placeholder).
+    /// place the picture draws it instead of those primitives.
     pub images: Vec<PlotImage>,
     pub bounds: Bounds2,
     /// The paper sheet when the list was built for a layout (paper space); the UI draws the
@@ -123,15 +122,18 @@ pub struct PlotText {
 /// A raster image in a plot: where it sits and the placeholder primitives that stand for it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotImage {
-    /// The first of the placeholder's [`PlotImage::PRIMS`] primitives (index in
-    /// [`DisplayList::prims`]).
+    /// The placeholder: its first primitive (index in [`DisplayList::prims`]) and how many
+    /// follow ([`PlotImage::PRIMS`], or the pieces left after a viewport's clipping).
     pub prim: u32,
+    pub prims: u32,
     /// Lower-left corner and the image's full width and height vectors, in world coordinates.
     pub origin: Vec2,
     pub u: Vec2,
     pub v: Vec2,
     /// Clip polygon in world coordinates; empty: the whole image.
     pub clip: Vec<Vec2>,
+    /// Seen through a viewport: the viewport's outline, which clips it too.
+    pub viewport: Vec<Vec2>,
     /// The image file as the drawing names it.
     pub path: String,
 }
@@ -815,7 +817,18 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
     // The contents are in paper units now: draw their pens before clipping.
     pen::apply(&mut sub.list, paper::paper_unit_mm(d));
     b.list.expanded = b.list.expanded.saturating_add(sub.list.expanded);
-    append_clipped(&mut b.list, &sub.list, clip);
+    let starts = append_clipped(&mut b.list, &sub.list, clip);
+    // Images keep the pieces of their placeholder that are left, clipped by the viewport too.
+    let outline = match clip {
+        Clip::Rect(r) => vec![r.min, Vec2::new(r.max.x, r.min.y), r.max, Vec2::new(r.min.x, r.max.y)],
+        Clip::Poly(c) => c.polygon().to_vec(),
+    };
+    for img in std::mem::take(&mut sub.list.images) {
+        let (Some(a), Some(z)) = (starts.get(img.prim as usize), starts.get((img.prim + img.prims) as usize)) else { continue };
+        if z > a {
+            b.list.images.push(PlotImage { prim: *a, prims: z - a, viewport: outline.clone(), ..img });
+        }
+    }
 }
 
 /// The clip region of a clipped viewport: the outline of its clip boundary entity, when that
@@ -836,8 +849,11 @@ enum Clip<'a> {
 }
 
 /// Append `src` to `dst`, clipped to `clip`.
-fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
+/// Returns where each source primitive's pieces start in `dst.prims` (and, last, the end).
+fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) -> Vec<u32> {
+    let mut starts = Vec::with_capacity(src.prims.len() + 1);
     for p in &src.prims {
+        starts.push(dst.prims.len() as u32);
         let pts = src.points(p);
         match (p.kind, clip) {
             (Kind::Polyline, Clip::Rect(rect)) => {
@@ -885,6 +901,8 @@ fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
             }
         }
     }
+    starts.push(dst.prims.len() as u32);
+    starts
 }
 
 fn push_raw(dst: &mut DisplayList, p: &DPrim, kind: Kind, pts: &[Vec2]) {
@@ -1241,10 +1259,12 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                 };
                 b.list.images.push(PlotImage {
                     prim,
+                    prims: PlotImage::PRIMS,
                     origin: at,
                     u: ctx.xf.apply(o + u) - at,
                     v: ctx.xf.apply(o + v) - at,
                     clip,
+                    viewport: Vec::new(),
                     path: i.path.clone(),
                 });
             }
