@@ -309,6 +309,16 @@ fn convert(args: &[String]) -> Result<(), String> {
 /// Plot layouts at their page setup. One layout writes `OUT.pdf`; several (or `all`) write
 /// `OUT-<layout>.pdf` each, as `publish` does.
 fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(), String> {
+    let names: Vec<String> = match s.doc() {
+        Ok(d) if layouts.iter().any(|l| l.eq_ignore_ascii_case("all")) => d.layouts.iter().map(|l| l.name.clone()).collect(),
+        Ok(d) => layouts.iter().filter_map(|n| d.layouts.iter().find(|l| l.name.eq_ignore_ascii_case(n)).map(|l| l.name.clone())).collect(),
+        Err(_) => Vec::new(),
+    };
+    for name in &names {
+        if let Some(m) = frame_paper(s, name) {
+            eprintln!("{m}");
+        }
+    }
     if let [one] = layouts
         && !one.eq_ignore_ascii_case("all")
     {
@@ -333,6 +343,55 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(),
         );
     }
     Ok(())
+}
+
+/// Gráfica heuristic: a layout whose drawn frame does not match its page setup's paper (it
+/// covers under half of the sheet, or does not fit) was plotted on another paper, chosen at plot
+/// time and not saved. Its paper becomes the frame's own size: the paper-space objects are
+/// moved to the origin and, for a frame under 100 mm on its short side (drawn in centimetres),
+/// scaled by 10. Only the session's copy changes. Returns the note to print when applied.
+fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
+    use cadcraft_engine::doc::{EntityKind, entity_bounds};
+    use cadcraft_engine::geom::Mat3;
+    let d = s.doc().ok()?;
+    let layout = d.layout(name)?;
+    let sheet = cadcraft_render::sheet(d, name)?;
+    let mut frame = Bounds2::EMPTY;
+    let mut handles = Vec::new();
+    for e in layout.entities.iter() {
+        handles.push(e.handle);
+        // Viewport 1 is the paper-space view itself, not something drawn on the sheet.
+        if matches!(&e.kind, EntityKind::Viewport(v) if v.id == 1) || !d.is_visible(e) {
+            continue;
+        }
+        frame = frame.union(&entity_bounds(d, e, 0));
+    }
+    let (w, h) = (frame.width() * sheet.unit_mm, frame.height() * sheet.unit_mm);
+    if !(frame.min.is_finite() && frame.max.is_finite() && w > 1.0 && h > 1.0) {
+        return None;
+    }
+    let (sw, sh) = (sheet.size.x * sheet.unit_mm, sheet.size.y * sheet.unit_mm);
+    let fits = (w <= sw * 1.01 && h <= sh * 1.01) || (w <= sh * 1.01 && h <= sw * 1.01);
+    if fits && w * h >= 0.5 * sw * sh {
+        return None;
+    }
+    let k = if w.min(h) < 100.0 { 10.0 } else { 1.0 };
+    let (pw, ph) = (w * k, h * k);
+    if pw.max(ph) > 5080.0 {
+        return None;
+    }
+    let was = layout.page.paper.clone();
+    let m = Mat3::scale(k, k).then_before(Mat3::translate(-frame.min));
+    let doc = s.doc_mut().ok()?;
+    for hd in handles {
+        doc.modify_entity(hd, |e| e.kind.transform(&m)).ok()?;
+    }
+    let page = json!({ "layout": name, "width": pw, "height": ph, "landscape": pw > ph, "margins": [0.0, 0.0, 0.0, 0.0] });
+    s.execute("pagesetup", &page).ok()?;
+    Some(format!(
+        "note: layout {name}: paper {pw:.0} x {ph:.0} mm taken from the drawn frame{}, not from the page setup ({was})",
+        if k > 1.0 { format!(" (x{k:.0})") } else { String::new() }
+    ))
 }
 
 /// The warning for the records of `path` the reader could not place, or `None` when there are none.
