@@ -552,6 +552,30 @@ pub fn sections(tags: &[Tag]) -> Vec<Section> {
     out
 }
 
+/// [`sections`], moving the tags instead of copying them, so a large file's tags are not held twice.
+pub fn into_sections(tags: Vec<Tag>) -> Vec<Section> {
+    let mut out = Vec::new();
+    let mut cur: Option<Section> = None;
+    let mut it = tags.into_iter();
+    while let Some(t) = it.next() {
+        let marker = |name: &str| t.code == 0 && t.str() == name;
+        match cur.take() {
+            Some(s) if marker("ENDSEC") => out.push(s),
+            Some(mut s) => {
+                s.tags.push(t);
+                cur = Some(s);
+            }
+            None if marker("SECTION") => {
+                let name = it.next().filter(|n| n.code == 2).map(|n| n.str()).unwrap_or_default();
+                cur = Some(Section { name, tags: Vec::new() });
+            }
+            None => {}
+        }
+    }
+    out.extend(cur);
+    out
+}
+
 /// Split a run of tags into records starting at each code-0 tag: (type, tags after the 0).
 pub fn records(tags: &[Tag]) -> Vec<(String, Vec<Tag>)> {
     let mut out: Vec<(String, Vec<Tag>)> = Vec::new();
@@ -591,6 +615,30 @@ mod tests {
         let recs = records(&secs[0].tags);
         assert_eq!(recs[0].0, "LINE");
         assert_eq!(recs[0].1.len(), 4);
+    }
+
+    #[test]
+    fn into_sections_matches_sections() {
+        let tags = vec![
+            Tag::s(999, "before"),
+            Tag::s(0, "SECTION"),
+            Tag::s(2, "HEADER"),
+            Tag::s(9, "$ACADVER"),
+            Tag::s(1, "AC1027"),
+            Tag::s(0, "ENDSEC"),
+            Tag::s(0, "LINE"),
+            Tag::s(0, "SECTION"),
+            Tag::s(0, "ENDSEC"),
+            Tag::s(8, "kept"),
+            Tag::s(0, "ENDSEC"),
+            Tag::s(0, "SECTION"),
+            Tag::s(2, "ENTITIES"),
+            Tag::s(0, "LINE"),
+        ];
+        let a = sections(&tags);
+        let b = into_sections(tags);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.iter().map(|s| (&s.name, &s.tags)).collect::<Vec<_>>(), b.iter().map(|s| (&s.name, &s.tags)).collect::<Vec<_>>());
     }
 
     #[test]

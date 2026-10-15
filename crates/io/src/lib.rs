@@ -62,7 +62,11 @@ fn ext(name: &str) -> String {
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
-        let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
+        let in_dwg = |e: IoError| IoError::Format(format!("{e} (in the DXF converted from this DWG)"));
+        let tags = cadcraft_dxf::parse(&dxf).map_err(|e| in_dwg(IoError::Format(e.to_string())))?;
+        // The DXF text is no longer needed; a large drawing's would otherwise sit beside its tags.
+        drop(dxf);
+        let mut d = dxf_read::read_tags(tags).map_err(in_dwg)?;
         d.read_notes = notes;
         return Ok(d);
     }
