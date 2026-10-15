@@ -353,6 +353,12 @@ mod native {
                 self.exceeded = true;
                 return Err(std::io::Error::other("DXF size limit reached"));
             }
+            // Grow by a quarter, not by doubling: past a few hundred MB, doubling asks for twice
+            // the text at once (a 31 MB DWG failed allocating 512 MB with the text at ~270 MB).
+            if self.buf.capacity() - self.buf.len() < b.len() {
+                let step = (self.buf.len() / 4).max(1 << 20).max(b.len());
+                self.buf.reserve_exact(step.min(self.limit - self.buf.len()));
+            }
             self.buf.extend_from_slice(b);
             Ok(b.len())
         }
