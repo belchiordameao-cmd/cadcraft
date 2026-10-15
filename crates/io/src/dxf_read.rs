@@ -485,7 +485,9 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             center: t.p(10),
             width: t.fd(40, 1.0),
             height: t.fd(41, 1.0),
-            view_center: Vec2::new(t.fd(12, 0.0), t.fd(22, 0.0)),
+            // 12/22 is the view centre relative to the view target (17/27/37); in plan view the
+            // model point at the centre is their sum.
+            view_center: Vec2::new(t.fd(12, 0.0) + t.fd(17, 0.0), t.fd(22, 0.0) + t.fd(27, 0.0)),
             view_height: t.fd(45, 1.0),
             id: t.i(69).unwrap_or(0) as u32,
             locked: t.i(90).unwrap_or(0) & 16384 != 0,
