@@ -340,7 +340,8 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(),
     let pb = std::path::Path::new(out);
     let stem = pb.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Drawing".into());
     let dir = pb.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
-    let file_part = |n: &str| -> String { n.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' }).collect() };
+    let file_part =
+        |n: &str| -> String { n.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' }).collect() };
     if split.is_empty() || !plain.is_empty() || (all && s.doc().is_ok_and(|d| !d.model.is_empty())) {
         let mut q = json!({ "path": out });
         if !split.is_empty() || !all {
@@ -406,7 +407,8 @@ fn sheet_frames(s: &Session, name: &str) -> Vec<Bounds2> {
     boxes.sort_by(|a, b| area(b).total_cmp(&area(a)));
     let all = boxes.iter().fold(Bounds2::EMPTY, |a, b| a.union(b));
     let tol = (all.width().hypot(all.height())) * 0.002;
-    let touch = |a: &Bounds2, b: &Bounds2| !(a.max.x + tol < b.min.x || b.max.x + tol < a.min.x || a.max.y + tol < b.min.y || b.max.y + tol < a.min.y);
+    let touch =
+        |a: &Bounds2, b: &Bounds2| !(a.max.x + tol < b.min.x || b.max.x + tol < a.min.x || a.max.y + tol < b.min.y || b.max.y + tol < a.min.y);
     let mut groups: Vec<Bounds2> = Vec::new();
     for b in boxes {
         let mut g = b;
