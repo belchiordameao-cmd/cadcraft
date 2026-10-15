@@ -307,73 +307,174 @@ fn convert(args: &[String]) -> Result<(), String> {
 }
 
 /// Plot layouts at their page setup. One layout writes `OUT.pdf`; several (or `all`) write
-/// `OUT-<layout>.pdf` each, as `publish` does.
+/// `OUT-<layout>.pdf` each, as `publish` does. A layout holding several separate sheet frames
+/// writes `OUT-<layout>-<n>.pdf`, one per frame, each on its frame's paper.
 fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(), String> {
+    if layouts.len() > 1 && layouts.iter().any(|l| l.eq_ignore_ascii_case("all")) {
+        return Err("--layout all cannot be combined with layout names".into());
+    }
+    let all = layouts[0].eq_ignore_ascii_case("all");
     let names: Vec<String> = match s.doc() {
-        Ok(d) if layouts.iter().any(|l| l.eq_ignore_ascii_case("all")) => d.layouts.iter().map(|l| l.name.clone()).collect(),
+        Ok(d) if all => d.layouts.iter().map(|l| l.name.clone()).collect(),
         Ok(d) => layouts.iter().filter_map(|n| d.layouts.iter().find(|l| l.name.eq_ignore_ascii_case(n)).map(|l| l.name.clone())).collect(),
         Err(_) => Vec::new(),
     };
+    let mut split: Vec<(String, Vec<Bounds2>)> = Vec::new();
     for name in &names {
-        if let Some(m) = frame_paper(s, name) {
+        let frames = sheet_frames(s, name);
+        if frames.len() > 1 {
+            split.push((name.clone(), frames));
+        } else if let Some(m) = frame_paper(s, name) {
             eprintln!("{m}");
         }
     }
-    if let [one] = layouts
-        && !one.eq_ignore_ascii_case("all")
+    let plain: Vec<String> = names.iter().filter(|n| !split.iter().any(|(m, _)| m == *n)).cloned().collect();
+    if split.is_empty()
+        && let [one] = layouts
+        && !all
     {
         let r = s.execute("exportpdf", &json!({ "path": out, "layout": one })).map_err(|e| e.to_string())?;
         eprintln!("wrote {out} ({} bytes, layout {one})", r["bytes"].as_u64().unwrap_or(0));
         return Ok(());
     }
-    if layouts.len() > 1 && layouts.iter().any(|l| l.eq_ignore_ascii_case("all")) {
-        return Err("--layout all cannot be combined with layout names".into());
+    let pb = std::path::Path::new(out);
+    let stem = pb.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Drawing".into());
+    let dir = pb.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let file_part = |n: &str| -> String { n.chars().map(|c| if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' }).collect() };
+    if split.is_empty() || !plain.is_empty() || (all && s.doc().is_ok_and(|d| !d.model.is_empty())) {
+        let mut q = json!({ "path": out });
+        if !split.is_empty() || !all {
+            // `publish` without `layouts` would also plot the split layouts whole.
+            q["layouts"] = json!(plain);
+        }
+        if !split.is_empty() && all && s.doc().is_ok_and(|d| !d.model.is_empty()) {
+            let path = dir.join(format!("{stem}-Model.pdf")).to_string_lossy().to_string();
+            let r = s.execute("exportpdf", &json!({ "path": path, "layout": "Model" })).map_err(|e| e.to_string())?;
+            eprintln!("wrote {path} ({} bytes, layout Model)", r["bytes"].as_u64().unwrap_or(0));
+        }
+        if q.get("layouts").is_none_or(|l| l.as_array().is_some_and(|a| !a.is_empty())) {
+            let r = s.execute("publish", &q).map_err(|e| e.to_string())?;
+            for sheet in r["sheets"].as_array().into_iter().flatten() {
+                eprintln!(
+                    "wrote {} ({} bytes, layout {})",
+                    sheet["path"].as_str().unwrap_or("?"),
+                    sheet["bytes"].as_u64().unwrap_or(0),
+                    sheet["layout"].as_str().unwrap_or("?")
+                );
+            }
+        }
     }
-    let mut q = json!({ "path": out });
-    if !layouts[0].eq_ignore_ascii_case("all") {
-        q["layouts"] = json!(layouts);
-    }
-    let r = s.execute("publish", &q).map_err(|e| e.to_string())?;
-    for sheet in r["sheets"].as_array().into_iter().flatten() {
-        eprintln!(
-            "wrote {} ({} bytes, layout {})",
-            sheet["path"].as_str().unwrap_or("?"),
-            sheet["bytes"].as_u64().unwrap_or(0),
-            sheet["layout"].as_str().unwrap_or("?")
-        );
+    for (name, frames) in &split {
+        eprintln!("note: layout {name}: {} separate sheet frames, one PDF each (gráfica heuristic)", frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let path = dir.join(format!("{stem}-{}-{}.pdf", file_part(name), i + 1)).to_string_lossy().to_string();
+            let (bytes, paper) = plot_frame(s, name, *f, &path)?;
+            eprintln!("wrote {path} ({bytes} bytes, layout {name}, frame {} of {}, paper {paper})", i + 1, frames.len());
+        }
     }
     Ok(())
 }
 
-/// Gráfica heuristic: a layout whose drawn frame covers under half of its page setup's paper
-/// was plotted on another paper, chosen at plot
-/// time and not saved. Its paper becomes the frame's own size: the paper-space objects are
-/// moved to the origin and, for a frame under 100 mm on its short side (drawn in centimetres),
-/// scaled by 10. Only the session's copy changes. Returns the note to print when applied.
-fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
+/// The paper-space objects of a layout that are drawn on the sheet (not viewport outlines, not
+/// on no-plot layers), with their bounds, and every object's handle.
+fn drawn_boxes(s: &Session, name: &str) -> Option<(Vec<Bounds2>, Vec<cadcraft_engine::doc::Handle>, f64)> {
     use cadcraft_engine::doc::{EntityKind, entity_bounds};
-    use cadcraft_engine::geom::Mat3;
     let d = s.doc().ok()?;
     let layout = d.layout(name)?;
     let sheet = cadcraft_render::sheet(d, name)?;
-    let mut frame = Bounds2::EMPTY;
+    let mut boxes = Vec::new();
     let mut handles = Vec::new();
     for e in layout.entities.iter() {
         handles.push(e.handle);
-        // Viewport outlines and no-plot layers are not part of the drawn sheet.
         if matches!(&e.kind, EntityKind::Viewport(_)) || !d.is_visible(e) || d.layer(&e.common.layer).is_some_and(|l| !l.plot) {
             continue;
         }
-        frame = frame.union(&entity_bounds(d, e, 0));
+        let b = entity_bounds(d, e, 0);
+        if b.min.is_finite() && b.max.is_finite() && !b.is_empty() {
+            boxes.push(b);
+        }
     }
-    let (w, h) = (frame.width() * sheet.unit_mm, frame.height() * sheet.unit_mm);
+    Some((boxes, handles, sheet.unit_mm))
+}
+
+/// Separate sheet frames in a layout: groups of drawn objects whose bounds touch, largest first
+/// merged, keeping groups of at least 5% of the largest one's area, in reading order (rows top to
+/// bottom, left to right). One group (or none) means a single sheet.
+fn sheet_frames(s: &Session, name: &str) -> Vec<Bounds2> {
+    let Some((mut boxes, _, _)) = drawn_boxes(s, name) else { return Vec::new() };
+    let area = |b: &Bounds2| b.width() * b.height();
+    boxes.sort_by(|a, b| area(b).total_cmp(&area(a)));
+    let all = boxes.iter().fold(Bounds2::EMPTY, |a, b| a.union(b));
+    let tol = (all.width().hypot(all.height())) * 0.002;
+    let touch = |a: &Bounds2, b: &Bounds2| !(a.max.x + tol < b.min.x || b.max.x + tol < a.min.x || a.max.y + tol < b.min.y || b.max.y + tol < a.min.y);
+    let mut groups: Vec<Bounds2> = Vec::new();
+    for b in boxes {
+        let mut g = b;
+        loop {
+            let before = groups.len();
+            groups.retain(|c| {
+                let t = touch(c, &g);
+                if t {
+                    g = g.union(c);
+                }
+                !t
+            });
+            if groups.len() == before {
+                break;
+            }
+        }
+        groups.push(g);
+    }
+    let big = groups.iter().map(area).fold(0.0, f64::max);
+    groups.retain(|g| area(g) >= 0.05 * big);
+    let row = groups.iter().map(Bounds2::height).fold(0.0, f64::max).max(1e-9);
+    groups.sort_by(|a, b| ((-a.center().y / row).round()).total_cmp(&(-b.center().y / row).round()).then(a.min.x.total_cmp(&b.min.x)));
+    groups
+}
+
+/// Plot one sheet frame of a layout on a paper of the frame's size (x10 when drawn in
+/// centimetres, as [`frame_paper`]): the layout is moved for the plot and moved back after.
+fn plot_frame(s: &mut Session, name: &str, frame: Bounds2, path: &str) -> Result<(u64, String), String> {
+    use cadcraft_engine::geom::Mat3;
+    let (_, handles, unit) = drawn_boxes(s, name).ok_or("layout")?;
+    let (w, h) = (frame.width() * unit, frame.height() * unit);
+    let k = if w.min(h) < 100.0 { 10.0 } else { 1.0 };
+    let (pw, ph) = ((w * k).min(5080.0), (h * k).min(5080.0));
+    let there = Mat3::scale(k, k).then_before(Mat3::translate(-frame.min));
+    let back = Mat3::translate(frame.min).then_before(Mat3::scale(1.0 / k, 1.0 / k));
+    let moved = |s: &mut Session, m: &Mat3| -> Result<(), String> {
+        let d = s.doc_mut().map_err(|e| e.to_string())?;
+        for h in &handles {
+            d.modify_entity(*h, |e| e.kind.transform(m)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    moved(s, &there)?;
+    let page = json!({ "layout": name, "width": pw, "height": ph, "landscape": pw > ph, "margins": [0.0, 0.0, 0.0, 0.0] });
+    let r = s.execute("pagesetup", &page).and_then(|_| s.execute("exportpdf", &json!({ "path": path, "layout": name })));
+    moved(s, &back)?;
+    let r = r.map_err(|e| e.to_string())?;
+    Ok((r["bytes"].as_u64().unwrap_or(0), format!("{pw:.0} x {ph:.0} mm{}", if k > 1.0 { " (x10)" } else { "" })))
+}
+
+/// Gráfica heuristic: a layout whose drawn frame covers under half of its page setup's paper
+/// was plotted on another paper, chosen at plot time and not saved. Its paper becomes the
+/// frame's own size: the paper-space objects are moved to the origin and, for a frame under
+/// 100 mm on its short side (drawn in centimetres), scaled by 10. Only the session's copy
+/// changes. Returns the note to print when applied.
+fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
+    use cadcraft_engine::geom::Mat3;
+    let (boxes, handles, unit) = drawn_boxes(s, name)?;
+    let frame = boxes.iter().fold(Bounds2::EMPTY, |a, b| a.union(b));
+    let (w, h) = (frame.width() * unit, frame.height() * unit);
     if !(frame.min.is_finite() && frame.max.is_finite() && w > 1.0 && h > 1.0) {
         return None;
     }
+    let d = s.doc().ok()?;
+    let sheet = cadcraft_render::sheet(d, name)?;
     let (sw, sh) = (sheet.size.x * sheet.unit_mm, sheet.size.y * sheet.unit_mm);
     let fits = (w <= sw * 1.01 && h <= sh * 1.01) || (w <= sh * 1.01 && h <= sw * 1.01);
-    // A frame larger than the paper is usually several sheets in one layout, each plotted by
-    // window: left alone.
+    // A frame larger than the paper is usually several sheets in one layout ([`sheet_frames`]).
     if !fits || w * h >= 0.5 * sw * sh {
         return None;
     }
@@ -382,7 +483,7 @@ fn frame_paper(s: &mut Session, name: &str) -> Option<String> {
     if pw.max(ph) > 5080.0 {
         return None;
     }
-    let was = layout.page.paper.clone();
+    let was = d.layout(name)?.page.paper.clone();
     let m = Mat3::scale(k, k).then_before(Mat3::translate(-frame.min));
     let doc = s.doc_mut().ok()?;
     for hd in handles {
