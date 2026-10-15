@@ -727,6 +727,19 @@ fn viewport_frozen_layers_read_from_341_without_xdata() {
 }
 
 #[test]
+fn viewport_frozen_layers_read_from_331_as_autocad_2004_and_later_write_them() {
+    // R2000–R2002 list a viewport's frozen layers in group 341; R2004 and later (and ezdxf) in 331.
+    let (_, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let x = p[r.clone()].iter().position(|(c, _)| c == "1001").unwrap() + r.start;
+    let mut q: Vec<(String, String)> = p[..r.start].to_vec();
+    q.extend(p[r.start..x].iter().map(|(c, v)| (if c == "341" { "331".into() } else { c.clone() }, v.clone())));
+    q.extend(p[r.end..].iter().cloned());
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
+}
+
+#[test]
 fn viewport_frozen_xdata_wins_over_341() {
     let (_, p) = frozen_vp_dxf();
     let r = vp_record(&p, "2");

@@ -1083,12 +1083,13 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
             }
             rx.mleader_fix.push((h, pending));
         }
-        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's group 341 layer handles.
+        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's layer handles: group 341 in
+        // R2000–R2002 files, 331 from R2004 on.
         ("VIEWPORT", EntityKind::Viewport(v)) if v.frozen_layers.is_empty() => {
             v.frozen_layers = tags
                 .iter()
                 .take_while(|t| t.code < 1000)
-                .filter(|t| t.code == 341)
+                .filter(|t| t.code == 331 || t.code == 341)
                 .filter_map(|t| rx.layers.get(&t.str().trim().to_ascii_uppercase()).cloned())
                 .collect();
         }
