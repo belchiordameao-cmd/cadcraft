@@ -399,7 +399,7 @@ fn drawn_boxes(s: &Session, name: &str) -> Option<(Vec<Bounds2>, Vec<cadcraft_en
 }
 
 /// Separate sheet frames in a layout: groups of drawn objects whose bounds touch, largest first
-/// merged, keeping groups of at least 5% of the largest one's area, in reading order (rows top to
+/// merged, keeping groups of at least 10% of the largest one's area (an A3 beside an A0 is 12.5%), in reading order (rows top to
 /// bottom, left to right). One group (or none) means a single sheet.
 fn sheet_frames(s: &Session, name: &str) -> Vec<Bounds2> {
     let Some((mut boxes, _, _)) = drawn_boxes(s, name) else { return Vec::new() };
@@ -428,7 +428,7 @@ fn sheet_frames(s: &Session, name: &str) -> Vec<Bounds2> {
         groups.push(g);
     }
     let big = groups.iter().map(area).fold(0.0, f64::max);
-    groups.retain(|g| area(g) >= 0.05 * big);
+    groups.retain(|g| area(g) >= 0.1 * big);
     let row = groups.iter().map(Bounds2::height).fold(0.0, f64::max).max(1e-9);
     groups.sort_by(|a, b| ((-a.center().y / row).round()).total_cmp(&(-b.center().y / row).round()).then(a.min.x.total_cmp(&b.min.x)));
     groups
