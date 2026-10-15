@@ -335,6 +335,8 @@ mod native {
                 add.push_str(&format!("  9\r\n{name}\r\n{code:>3}\r\n{value}\r\n"));
             }
         }
+        // Exact room for the added lines: `splice` past capacity would double a text of hundreds of MB.
+        dxf.reserve_exact(add.len());
         dxf.splice(end..end, add.into_bytes());
         dxf
     }
