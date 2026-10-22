@@ -6,7 +6,14 @@ jobs:
   xtask-ci:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # upstream de 21/10 estoura o disco do runner no `cargo test --workspace` (ld Bus error / No space left
+    # on device): debuginfo so de linhas + sem incremental, e libera o que o runner traz e o build nao usa
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
