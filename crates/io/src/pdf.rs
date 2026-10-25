@@ -101,6 +101,9 @@ pub struct PdfOptions {
     /// Plot objects with their transparency (PDF alpha). `None` = the page setup's "Plot
     /// transparency" (off for model space).
     pub plot_transparency: Option<bool>,
+    /// Folder raster images with a relative (or not found) path are looked for in: the
+    /// drawing's folder. Images that cannot be read plot as their placeholder.
+    pub image_dir: Option<String>,
 }
 
 impl Default for PdfOptions {
@@ -125,6 +128,7 @@ impl Default for PdfOptions {
             margins: None,
             hyperlinks: true,
             plot_transparency: None,
+            image_dir: None,
         }
     }
 }
@@ -161,6 +165,7 @@ impl PdfOptions {
             margins: margins(v.get("margins")),
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
+            image_dir: v.get("imageDir").and_then(Value::as_str).map(str::to_string),
         }
     }
 }
@@ -235,7 +240,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                 let mut po = PdfOptions::from_json(&serde_json::json!({
                     "paper": pg.get("paper"), "landscape": pg.get("landscape"), "scale": pg.get("scale"),
                     "plotStyleTable": opts.get("plotStyleTable"), "lineweights": opts.get("lineweights"),
-                    "margins": opts.get("margins"), "text": opts.get("text"),
+                    "margins": opts.get("margins"), "text": opts.get("text"), "imageDir": opts.get("imageDir"),
                 }));
                 po.window = Some(w);
                 po.fit = Some(true);
@@ -506,6 +511,8 @@ struct SheetPage {
     links: Vec<(Bounds2, String)>,
     /// Page label: the layout name.
     label: String,
+    /// Where raster images with a relative path are looked for ([`PdfOptions::image_dir`]).
+    image_dir: Option<String>,
 }
 
 /// Plot one space.
@@ -566,7 +573,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space), image_dir: o.image_dir.clone() })
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.
@@ -813,12 +820,33 @@ fn marks(s: &mut Surface<'_>, p: &SheetPage, groups: &Groups, fonts: &mut fonts:
     let white = Rgb(255, 255, 255);
     let mut batch: Option<(StrokeStyle, PathBuilder)> = None;
     let mut layer: Option<OcgId> = None;
+    // Raster images that could be read, by their placeholder's first primitive; the rest of a
+    // placeholder replaced by its image is skipped.
+    let mut decoded: std::collections::HashMap<&str, Option<kr::image::Image>> = std::collections::HashMap::new();
+    let mut images = std::collections::HashMap::new();
+    for img in &list.images {
+        let pic = decoded.entry(img.path.as_str()).or_insert_with(|| image_file(&img.path, p.image_dir.as_deref()));
+        if let Some(pic) = pic {
+            images.insert(img.prim, (pic.clone(), img));
+        }
+    }
+    let mut skip = 0u32;
     for (i, prim) in list.prims.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
         let want = list.prim_layers.get(i).and_then(|l| groups.ids.get(l)).copied();
         if want != layer {
             flush(s, &mut batch);
             layer_changed(s, layer, want)?;
             layer = want;
+        }
+        if let Some((pic, img)) = u32::try_from(i).ok().and_then(|i| images.get(&i)) {
+            flush(s, &mut batch);
+            image(s, pic.clone(), img, map);
+            skip = img.prims.saturating_sub(1);
+            continue;
         }
         let rgb = prim.display_rgb(white);
         let raw = list.points(prim);
@@ -921,6 +949,87 @@ fn marks(s: &mut Surface<'_>, p: &SheetPage, groups: &Groups, fonts: &mut fonts:
     }
     flush(s, &mut batch);
     layer_changed(s, layer, None)
+}
+
+/// Draw raster image `pic` over the parallelogram of `img`, clipped to its boundary and to the
+/// viewport it is seen through.
+fn image(s: &mut Surface<'_>, pic: kr::image::Image, img: &cadcraft_render::PlotImage, map: &Map) {
+    let o = map.pt(img.origin);
+    let (Some((a, b)), Some((c, d)), Some((e, f))) = (coord(map.pt(img.origin + img.u) - o), coord(map.pt(img.origin + img.v) - o), coord(o)) else {
+        return;
+    };
+    let det = a * d - b * c;
+    if !det.is_finite() || det == 0.0 {
+        return;
+    }
+    let mut pushed = 0;
+    for outline in [&img.viewport, &img.clip] {
+        if outline.len() < 3 {
+            continue;
+        }
+        let Some(pts) = outline.iter().map(|q| coord(map.pt(*q))).collect::<Option<Vec<_>>>() else { continue };
+        let mut pb = PathBuilder::new();
+        for (j, (x, y)) in pts.iter().enumerate() {
+            if j == 0 {
+                pb.move_to(*x, *y);
+            } else {
+                pb.line_to(*x, *y);
+            }
+        }
+        pb.close();
+        if let Some(path) = pb.finish() {
+            s.push_clip_path(&path, &FillRule::NonZero);
+            pushed += 1;
+        }
+    }
+    // The writer draws the image's first row at the top of a unit square on its y-down surface:
+    // map that square's top edge to the image's upper side (origin + v).
+    s.push_transform(&Transform::from_row(a, b, -c, -d, e + c, f + d));
+    if let Some(size) = kr::geom::Size::from_wh(1.0, 1.0) {
+        s.draw_image(pic, size);
+    }
+    s.pop();
+    for _ in 0..pushed {
+        s.pop();
+    }
+}
+
+/// The image file `path` names: as written, else in `dir` (relative paths, then the bare file
+/// name, as AutoCAD falls back to the drawing's folder).
+#[cfg(not(target_arch = "wasm32"))]
+fn find_image(path: &str, dir: Option<&str>) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let own = Path::new(path);
+    if own.is_file() {
+        return Some(own.to_path_buf());
+    }
+    let dir = Path::new(dir?);
+    let rel = path.replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    [dir.join(rel), dir.join(name)].into_iter().find(|p: &PathBuf| p.is_file())
+}
+
+/// Largest image (pixels) embedded in a plot; larger ones keep the placeholder.
+const MAX_IMAGE_PIXELS: u64 = 64_000_000;
+
+/// The raster image file `path` decoded for the writer, or `None` when it cannot be read.
+fn image_file(path: &str, dir: Option<&str>) -> Option<kr::image::Image> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (path, dir);
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let file = find_image(path, dir)?;
+        let img = image::ImageReader::open(file).ok()?.with_guessed_format().ok()?.decode().ok()?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+            return None;
+        }
+        Some(kr::image::Image::from_rgba8(img.to_rgba8().into_raw(), w, h))
+    }
 }
 
 /// Write one glyph as text in its embedded font: font size 1, placed by the glyph's matrix (one
