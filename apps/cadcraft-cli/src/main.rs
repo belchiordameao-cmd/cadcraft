@@ -925,6 +925,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn convert_layout_plots_viewport_content() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-layoutvp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        // Same drawing; SHEET B additionally gets a viewport showing the sample's model space.
+        run(&a(&[
+            "--sample",
+            "--cmd",
+            r#"layout.new {"name":"EMPTY"}"#,
+            "--cmd",
+            r#"layout.new {"name":"WITHVP"}"#,
+            "--cmd",
+            r#"mview {"layout":"WITHVP","p1":[10,10],"p2":[200,150]}"#,
+            "--save",
+            &path("in.dxf"),
+        ]))
+        .unwrap();
+        convert(&a(&[&path("in.dxf"), &path("e.pdf"), "--layout", "EMPTY"])).unwrap();
+        convert(&a(&[&path("in.dxf"), &path("v.pdf"), "--layout", "WITHVP"])).unwrap();
+        let (e, v) = (std::fs::read(path("e.pdf")).unwrap(), std::fs::read(path("v.pdf")).unwrap());
+        assert!(v.len() > e.len(), "viewport content missing: empty {} bytes, with viewport {} bytes", e.len(), v.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).into()).collect()
     }
