@@ -26,7 +26,7 @@ use cadcraft_geom::Bounds2;
 
 pub use cadcraft_dxf::Version;
 pub use dxf_read::{LeftOut, ReadOptions, entity_from_groups};
-pub use dxf_write::entity_groups;
+pub use dxf_write::{MAX_BRIDGE_COPIES, entity_groups};
 pub use pdf::{PdfOptions, pdf, plot, plot_with_warnings};
 
 /// How a drawing is saved as DXF or DWG.
@@ -116,7 +116,7 @@ pub fn write_with(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<Vec<u8>
         // gradients, so a drawing from an R2000 DXF doesn't lose them by default.
         "dwg" if !opts.binary => {
             let version = opts.version.unwrap_or_else(|| version.max(Version::R2004));
-            cadcraft_dwg::dxf_to_dwg_as(dxf_write::dwg_bridge(d, version).as_bytes(), version.code()).map_err(IoError::Format)
+            cadcraft_dwg::dxf_to_dwg_as(dxf_write::dwg_bridge(d, version).0.as_bytes(), version.code()).map_err(IoError::Format)
         }
         e if opts.binary => Err(IoError::Format(format!("binary output is for DXF files, not `{e}`"))),
         _ => write_framed(d, name, None),
@@ -133,12 +133,13 @@ pub fn write_with_warnings(d: &Drawing, name: &str, opts: &SaveOptions) -> Resul
         return write_with(d, name, opts).map(|b| (b, Vec::new()));
     }
     let version = opts.version.unwrap_or_else(|| save_version(d).max(Version::R2004));
-    let text = dxf_write::dwg_bridge(d, version);
+    // What the bridge's text already gives up on comes first, then what the DWG read back lacks.
+    let (text, mut warnings) = dxf_write::dwg_bridge(d, version);
     let bytes = cadcraft_dwg::dxf_to_dwg_as(text.as_bytes(), version.code()).map_err(IoError::Format)?;
-    let warnings = match cadcraft_dwg::dwg_to_dxf_noted(&bytes, cadcraft_dwg::Limits::DEFAULT) {
+    warnings.extend(match cadcraft_dwg::dwg_to_dxf_noted(&bytes, cadcraft_dwg::Limits::DEFAULT) {
         Ok((back, _)) => dwg_check::dwg_loss(text.as_bytes(), &back),
         Err(e) => vec![format!("The DWG written could not be read back ({e}): whether it kept everything is not known.")],
-    };
+    });
     Ok((bytes, warnings))
 }
 

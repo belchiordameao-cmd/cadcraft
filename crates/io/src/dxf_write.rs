@@ -12,6 +12,15 @@ use cadcraft_geom::{Bounds2, Vec2, Vec3};
 
 use crate::dxf_ext::{self, DimVal, K};
 
+/// The most copies a block reference repeated in columns and rows, with attributes, goes to the
+/// DWG bridge as (one plain reference per copy; see the INSERT arm of [`entity`]). A reference
+/// with more cells goes as the one record it is, which the bridge may lose or read wrong, and
+/// the DWG read back says so. Measured (one attribute per copy): 10 000 copies cost 0.5 s, about
+/// 80 MB and 460 KB of DWG; 40 000 cost 2.3 s and 320 MB; 250 000 cost 34 s, 1.7 GB and an
+/// 11 MB DWG; 1 000 000 ran out of memory under a 4 GB ceiling and aborted without a file. Ten
+/// thousand is the cap the drawing puts on an array's columns and rows anyway.
+pub const MAX_BRIDGE_COPIES: u64 = 10_000;
+
 struct W {
     t: Vec<Tag>,
     next: u64,
@@ -22,6 +31,10 @@ struct W {
     /// Persistent reactors of boundary objects: each source object of an associative hatch →
     /// the hatches (groups `{ACAD_REACTORS 330 …}`), from [`hatch_reactors`].
     reactors: HashMap<Handle, Vec<String>>,
+    /// Block references repeated in more cells than [`MAX_BRIDGE_COPIES`], with attributes, in
+    /// the DWG bridge's text: block name, columns, rows. The bridge gets them as the array
+    /// records they are, which it reads back wrong or loses (see [`dwg_bridge`]).
+    over_limit: Vec<(String, u32, u32)>,
 }
 
 impl W {
@@ -204,7 +217,7 @@ fn annotative_xdata(w: &mut W) {
 
 /// Override (`ACAD` DSTYLE) and associativity (`CADCRAFT` ASSOC) xdata of a dimension.
 fn dim_xdata(w: &mut W, dm: &Dimension, cx: &Ctx) {
-    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new() };
+    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new(), over_limit: Vec::new() };
     let mut sah = false;
     for (k, v) in &dm.overrides {
         let Some(field) = DimStyle::field_name(k) else { continue };
@@ -753,8 +766,12 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             // the count of owned attributes (2004 and later), and skips the record or reads the
             // array wrong. The bridge gets one plain reference per copy, each with the attributes
             // moved along, which draws the same; a DXF file keeps the one reference.
-            let copies: Vec<Vec3> = if cx.bridge && !i.attribs.is_empty() && (i.cols > 1 || i.rows > 1) {
-                let (cols, rows) = (i.cols.clamp(1, 10_000), i.rows.clamp(1, 10_000));
+            // Up to MAX_BRIDGE_COPIES of them: beyond that the reference goes as the one record it
+            // is (the DWG keeps its shape; the check of the DWG read back says what the bridge
+            // lost), not as a text, a DWG and a reading of it the size of the array.
+            let cells = u64::from(i.cols.max(1)) * u64::from(i.rows.max(1));
+            let copies: Vec<Vec3> = if cx.bridge && !i.attribs.is_empty() && cells > 1 && cells <= MAX_BRIDGE_COPIES {
+                let (cols, rows) = (i.cols.max(1), i.rows.max(1));
                 (0..rows)
                     .flat_map(|r| (0..cols).map(move |c| (c, r)))
                     .map(|(c, r)| {
@@ -763,6 +780,9 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                     })
                     .collect()
             } else {
+                if cx.bridge && !i.attribs.is_empty() && cells > MAX_BRIDGE_COPIES {
+                    w.over_limit.push((i.block.clone(), i.cols, i.rows));
+                }
                 vec![Vec3::new(0.0, 0.0, 0.0)]
             };
             let as_array = copies.len() == 1 && (i.cols > 1 || i.rows > 1);
@@ -1593,15 +1613,32 @@ pub fn write(d: &Drawing) -> String {
 
 /// The drawing's DXF tags, declaring `version` in `$ACADVER`.
 pub fn tags(d: &Drawing, version: Version) -> Vec<Tag> {
-    tags_for(d, version, version, false)
+    tags_for(d, version, version, false).0
 }
 
 /// The R2000 DXF the DWG bridge converts to a `dwg` version DWG: its entity types are the DWG
-/// version's (MULTILEADER from 2007).
-pub(crate) fn dwg_bridge(d: &Drawing, dwg: Version) -> String {
-    let mut tags = tags_for(d, Version::R2000, dwg, true);
+/// version's (MULTILEADER from 2007). With it, what the text already gives up on: a block
+/// reference repeated in more cells than [`MAX_BRIDGE_COPIES`], with attributes, goes as the
+/// array record it is, which the bridge reads back with the wrong sizes (101 x 100 came back
+/// 1 x 101, the record count unchanged, so the DWG read back says nothing) or loses.
+pub(crate) fn dwg_bridge(d: &Drawing, dwg: Version) -> (String, Vec<String>) {
+    let (mut tags, over_limit) = tags_for(d, Version::R2000, dwg, true);
     bridge_markers(&mut tags);
-    cadcraft_dxf::write_ascii(&tags)
+    let notes = if over_limit.is_empty() {
+        Vec::new()
+    } else {
+        let which: Vec<String> = over_limit.iter().map(|(b, c, r)| format!("{b} {c} x {r}")).collect();
+        vec![format!(
+            "{} block reference{} with attributes repeated in more than {MAX_BRIDGE_COPIES} cells ({}) go{} to the DWG as the one record each is: \
+             the DWG bridge reads such a record back with the wrong columns and rows, or not at all. Saving as DXF keeps {}.",
+            over_limit.len(),
+            if over_limit.len() == 1 { "" } else { "s" },
+            which.join(", "),
+            if over_limit.len() == 1 { "es" } else { "" },
+            if over_limit.len() == 1 { "it" } else { "them" },
+        )]
+    };
+    (cadcraft_dxf::write_ascii(&tags), notes)
 }
 
 /// Subclass markers the DWG bridge knows by another spelling (it matches them exactly):
@@ -1618,7 +1655,7 @@ fn bridge_markers(tags: &mut [Tag]) {
 
 /// The drawing's DXF tags, declaring `version` in `$ACADVER`, with what `target` (the version the
 /// file ends up in: `version`, or the DWG version the bridge writes) has.
-fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> Vec<Tag> {
+fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> (Vec<Tag>, Vec<(String, u32, u32)>) {
     // An in-place block edit in progress is not written: the drawing as before it.
     let committed = d.committed();
     let d: &Drawing = &committed;
@@ -1629,6 +1666,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> Vec
         pstyles: HashMap::new(),
         layers: HashMap::new(),
         reactors: hatch_reactors(d),
+        over_limit: Vec::new(),
     };
     // Pre-allocate handles for block records.
     let mut paper_layouts: Vec<&Layout> = d.layouts.iter().collect();
@@ -2102,7 +2140,8 @@ fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> Vec
         w.i(70, 0);
         let v = serde_json::to_value(s).unwrap_or_default();
         let defaults = serde_json::to_value(DimStyle::default()).unwrap_or_default();
-        let mut newer = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new() };
+        let mut newer =
+            W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new(), reactors: HashMap::new(), over_limit: Vec::new() };
         for (field, code, kind) in dxf_ext::DIM_CODES {
             let Some(enc) = v.get(*field).and_then(|x| cx.encode(*kind, x)) else { continue };
             if !dxf_ext::NEWER_CODES.contains(code) {
@@ -2511,7 +2550,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> Vec
     crate::dxf_raw::data_store(&mut w.t, d, target >= Version::R2013);
     add_class_instance_counts(&mut w.t);
     mark_xrefs(&mut w.t, d);
-    w.t
+    (w.t, w.over_limit)
 }
 
 /// Write DXF Reference group 91 on every CLASS record. Count records after `dxf_raw::finish`
@@ -2721,6 +2760,7 @@ pub fn entity_groups(d: &Drawing, e: &Entity) -> (String, Vec<Tag>) {
         pstyles: HashMap::new(),
         layers: HashMap::new(),
         reactors: HashMap::new(),
+        over_limit: Vec::new(),
     };
     let cx = Ctx { target: Version::R2018, ..Ctx::default() };
     let paper = d.space_of(e.handle).is_some_and(|s| !matches!(s, cadcraft_doc::Space::Model));
