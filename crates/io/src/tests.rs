@@ -2228,6 +2228,32 @@ fn kept_xrecord_application_group_roundtrips_as_read() {
     assert!(!out.contains("291\n2"), "no handle may be written under a bool code");
 }
 
+// ---------- named plot styles ----------
+
+/// A named-plot-style drawing keeps every plot style name its ACAD_PLOTSTYLENAME dictionary
+/// declares, used or not: a file written has a placeholder for each (two were lost from a real
+/// drawing, whose styles nothing used yet).
+#[test]
+fn declared_plot_style_names_are_kept_whether_used_or_not() {
+    let dxf = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$PSTYLEMODE\n290\n0\n0\nENDSEC\n\
+0\nSECTION\n2\nENTITIES\n0\nLINE\n5\n100\n100\nAcDbEntity\n8\n0\n390\n31\n100\nAcDbLine\n10\n0\n20\n0\n30\n0\n11\n1\n21\n1\n31\n0\n0\nENDSEC\n\
+0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_PLOTSTYLENAME\n350\nE\n\
+0\nACDBDICTIONARYWDFLT\n5\nE\n330\nC\n100\nAcDbDictionary\n281\n1\n3\nNormal\n350\nF\n3\nStyle A\n350\n31\n3\nStyle B\n350\n32\n100\nAcDbDictionaryWithDefault\n340\nF\n\
+0\nACDBPLACEHOLDER\n5\nF\n330\nE\n0\nACDBPLACEHOLDER\n5\n31\n330\nE\n0\nACDBPLACEHOLDER\n5\n32\n330\nE\n0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(dxf.as_bytes()).unwrap();
+    assert_eq!(d.plot_style_names, ["Style A", "Style B"]);
+    assert_eq!(d.model.iter().next().map(|e| e.common.plot_style.clone()).as_deref(), Some("Style A"));
+    let out = write_dxf(&d);
+    assert_eq!(dxf_records(&out, "ACDBPLACEHOLDER"), 3);
+    assert_eq!((dxf_groups(&out, "3", "Normal"), dxf_groups(&out, "3", "Style A"), dxf_groups(&out, "3", "Style B")), (1, 1, 1));
+    // And again from the file written: nothing drifts.
+    let again = write_dxf(&read_dxf(out.as_bytes()).unwrap());
+    assert_eq!(dxf_records(&again, "ACDBPLACEHOLDER"), 3);
+    // A drawing made here declares none: Normal alone, as before.
+    let fresh = write_dxf(&Drawing::new_metric());
+    assert_eq!(dxf_records(&fresh, "ACDBPLACEHOLDER"), 1);
+}
+
 // ---------- DGN line-style objects and the raw keeper's cost ----------
 
 /// A DXF whose named object dictionary owns a DGN line-style component dictionary of `n`

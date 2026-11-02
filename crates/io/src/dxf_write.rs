@@ -1764,10 +1764,16 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     // The annotation scale list: the ACAD_SCALELIST dictionary of SCALE objects.
     let scale_dict = w.h();
     let scales: Vec<(&cadcraft_doc::AnnoScale, String)> = d.scales.iter().filter(|s| s.is_valid()).map(|s| (s, w.h())).collect();
-    // Plot style names used by layers and objects (Normal always), each a placeholder object.
+    // Plot style names: Normal always, those the drawing declares (used or not) and those
+    // layers and objects use, each a placeholder object.
     let pstyle_dict = w.h();
     let mut pstyle_names: Vec<String> = vec![cadcraft_doc::NORMAL_STYLE.to_string()];
-    let named = d.layers.iter().map(|l| l.plot_style.as_str()).chain(every.iter().map(|e| e.common.plot_style.as_str()));
+    let named = d
+        .plot_style_names
+        .iter()
+        .map(String::as_str)
+        .chain(d.layers.iter().map(|l| l.plot_style.as_str()))
+        .chain(every.iter().map(|e| e.common.plot_style.as_str()));
     for n in named {
         let n = n.trim();
         let logical = n.is_empty() || n.eq_ignore_ascii_case("bylayer") || n.eq_ignore_ascii_case("byblock");

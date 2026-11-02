@@ -992,10 +992,17 @@ struct Rx {
 }
 
 /// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
-/// named object dictionary (the first object), by placeholder handle.
-fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
+/// named object dictionary (the first object), by placeholder handle, and in the dictionary's
+/// order (Normal left out).
+fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> (HashMap<String, String>, Vec<String>) {
+    let (names, declared) = plot_style_entries(secs);
+    (names, declared.into_iter().filter(|n| !n.eq_ignore_ascii_case(cadcraft_doc::NORMAL_STYLE)).collect())
+}
+
+fn plot_style_entries(secs: &[cadcraft_dxf::Section]) -> (HashMap<String, String>, Vec<String>) {
     let mut out = HashMap::new();
-    let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return out };
+    let mut order = Vec::new();
+    let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return (out, order) };
     let recs = record_slices(&objects.tags);
     let entries = |tags: &[Tag]| {
         let mut v: Vec<(String, String)> = Vec::new();
@@ -1013,20 +1020,24 @@ fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
         }
         v
     };
-    let Some((_, root)) = recs.iter().find(|(k, _)| k == "DICTIONARY") else { return out };
+    let Some((_, root)) = recs.iter().find(|(k, _)| k == "DICTIONARY") else { return (out, order) };
     let Some((_, dict)) = entries(root).into_iter().find(|(n, _)| n.eq_ignore_ascii_case(crate::dxf_ext::PLOT_STYLE_NAMES_KEY)) else {
-        return out;
+        return (out, order);
     };
     let is_dict = |k: &str| k == "DICTIONARY" || k == "ACDBDICTIONARYWDFLT";
     let Some((_, tags)) = recs.iter().find(|(k, tg)| is_dict(k) && T(tg).s(5).is_some_and(|h| h.trim().eq_ignore_ascii_case(&dict))) else {
-        return out;
+        return (out, order);
     };
     for (n, h) in entries(tags).into_iter().take(crate::dxf_ext::MAX_PLOT_STYLE_NAMES) {
         if !n.trim().is_empty() {
-            out.insert(h, n.chars().take(255).collect());
+            let name: String = n.chars().take(255).collect();
+            if !order.iter().any(|x: &String| x.eq_ignore_ascii_case(&name)) {
+                order.push(name.clone());
+            }
+            out.insert(h, name);
         }
     }
-    out
+    (out, order)
 }
 
 /// The named plot style an entity record points at (group 390 among its AcDbEntity groups).
@@ -1698,7 +1709,9 @@ pub fn read_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, tr
     trace("plot style names");
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
-    let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
+    let (pstyles, declared_plot_styles) = plot_style_names(&secs);
+    let mut rx = Rx { pstyles, ..Rx::default() };
+    d.plot_style_names = declared_plot_styles;
     let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
