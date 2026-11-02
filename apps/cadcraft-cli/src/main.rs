@@ -57,7 +57,7 @@ fn stdout_failed(e: std::io::Error) {
 
 const USAGE: &str = "usage:
   cadcraft-cli info FILE.dxf
-  cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING]
+  cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING] [--keep-all]
   cadcraft-cli info FILE --layouts   page setup + viewport fields of every layout (diagnostics)
   cadcraft-cli convert IN.dxf OUT.pdf --layout NAME [--layout NAME2]... | --layout all | --layout sheets [--fit]
                            plot paper-space layouts at their page setup (paper, scale, plot
@@ -65,12 +65,16 @@ const USAGE: &str = "usage:
                            Model (when it has objects) and every layout, `sheets` every layout
                            without the Model. --fit scales each layout's contents to fit its
                            printable area instead.
-  cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
+  cadcraft-cli run [FILE | --sample | --metric] [--keep-all] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT [--lazy] [--launch]]
   cadcraft-cli perf [N | FILE]
-  cadcraft-cli perf FILE --open    time the phases of opening FILE (DWG -> DXF text -> groups -> document),
+  cadcraft-cli perf FILE --open [--keep-all]
+                           time the phases of opening FILE (DWG -> DXF text -> groups -> document),
                            with the memory each one takes and the file's records by type
+  --keep-all               keep every object the file has, whatever the cost: a drawing otherwise
+                           keeps at most 10 000 DGN line-style objects (LS*), and a file saved
+                           from it lacks the rest (convert and --save warn on stderr)
   cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version
 
@@ -178,6 +182,7 @@ fn install_io() {
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
         plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
     });
+    cadcraft_engine::cmd::file::set_read_all(|b, name| cadcraft_io::read_all(b, name).map_err(|e| e.to_string()));
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
@@ -189,7 +194,19 @@ fn install_io() {
 }
 
 fn open(s: &mut Session, path: &str) -> Result<(), String> {
-    s.execute("open", &json!({ "path": path })).map(|_| ()).map_err(|e| e.to_string())
+    open_keeping(s, path, false).map(|_| ())
+}
+
+/// Open `path`, keeping every object the file has when `keep_all` (`--keep-all`); OPEN's reply,
+/// whose `warnings` say what reading left out.
+fn open_keeping(s: &mut Session, path: &str, keep_all: bool) -> Result<Value, String> {
+    s.execute("open", &json!({ "path": path, "keepAll": keep_all })).map_err(|e| e.to_string())
+}
+
+/// Whether `path` names a drawing file (DXF or DWG), which a save writes the drawing to.
+fn is_drawing_output(path: &str) -> bool {
+    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "dxf" | "dwg")
 }
 
 #[derive(Clone, Copy)]
@@ -218,7 +235,7 @@ fn validate_options(command: &str, args: &[String], specs: &[OptionSpec]) -> Res
 }
 
 const NO_OPTIONS: &[OptionSpec] = &[];
-const PERF_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--open", takes_value: false }];
+const PERF_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--open", takes_value: false }, OptionSpec { name: "--keep-all", takes_value: false }];
 const INFO_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--layouts", takes_value: false }];
 
 /// `info FILE --layouts`: per-layout page setup and viewport fields, for diagnosing a sheet
@@ -293,6 +310,12 @@ fn export_framed(s: &Session, out: &str, window: Option<Bounds2>) -> Result<(), 
     let bytes = cadcraft_io::write_framed_from(d, out, window, dir).map_err(|e| e.to_string())?;
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
+    // A drawing file written lacks what reading the drawing left out.
+    if is_drawing_output(out) {
+        for note in &d.read_notes {
+            eprintln!("warning: {note}");
+        }
+    }
     if cadcraft_engine::cmd::file::drops_unknown(out) {
         let lost = cadcraft_engine::cmd::file::not_saved(d);
         if let Some(m) = cadcraft_engine::cmd::file::not_saved_message(&lost) {
@@ -346,6 +369,7 @@ fn convert(args: &[String]) -> Result<(), String> {
     let mut framing = Framing::Auto;
     let mut layouts: Vec<String> = Vec::new();
     let mut fit = false;
+    let mut keep_all = false;
     let mut files = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -353,6 +377,8 @@ fn convert(args: &[String]) -> Result<(), String> {
             layouts.push(it.next().ok_or("--layout needs a layout name (or `all`)")?.clone());
         } else if a == "--fit" {
             fit = true;
+        } else if a == "--keep-all" {
+            keep_all = true;
         } else if !framing_option(a, &mut it, &mut framing)? {
             files.push(a);
         }
@@ -361,7 +387,7 @@ fn convert(args: &[String]) -> Result<(), String> {
     check_framed_output(framing, Some(o))?;
     check_layout_output(&layouts, framing, o, fit)?;
     let mut s = Session::empty();
-    open(&mut s, i)?;
+    open_keeping(&mut s, i, keep_all)?;
     if let Some(m) = skipped_message(s.doc().map_err(|e| e.to_string())?, i) {
         eprintln!("{m}");
     }
@@ -437,6 +463,7 @@ fn skipped_message(d: &cadcraft_engine::doc::Drawing, path: &str) -> Option<Stri
 
 fn run(args: &[String]) -> Result<(), String> {
     let mut s = Session::empty();
+    let keep_all = args.iter().any(|a| a == "--keep-all");
     let mut it = args.iter();
     let mut save = None;
     let mut exp: Option<String> = None;
@@ -461,7 +488,10 @@ fn run(args: &[String]) -> Result<(), String> {
             "--cmd" => steps.push(("cmd".into(), it.next().ok_or("--cmd needs `id {json}`")?.clone())),
             "--save" => save = Some(it.next().ok_or("--save needs a path")?.clone()),
             "--export" => exp = Some(it.next().ok_or("--export needs a path")?.clone()),
-            f if !f.starts_with("--") => open(&mut s, f)?,
+            "--keep-all" => {}
+            f if !f.starts_with("--") => {
+                open_keeping(&mut s, f, keep_all)?;
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -581,7 +611,7 @@ fn mem_line() -> String {
 /// or needs too much memory: the DWG read and its DXF rendition (acadrust), the groups, the
 /// sections, the records by type (count, groups, text, the largest record) and the document.
 /// The text is parsed once: the document is built from the sections the report looked at.
-fn perf_open(path: &str) -> Result<(), String> {
+fn perf_open(path: &str, keep_all: bool) -> Result<(), String> {
     use cadcraft_dxf::Value as V;
     use std::collections::HashMap;
     use std::time::Instant;
@@ -590,7 +620,8 @@ fn perf_open(path: &str) -> Result<(), String> {
     outln!("{path}: {:.1} MB; {}", mb(bytes.len()), mem_line());
     let t0 = Instant::now();
     let dxf = if cadcraft_dwg::is_dwg(&bytes) {
-        let (dxf, notes, p) = cadcraft_dwg::dwg_to_dxf_probed(&bytes, cadcraft_dwg::Limits::DEFAULT)?;
+        let limits = if keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
+        let (dxf, notes, p) = cadcraft_dwg::dwg_to_dxf_probed(&bytes, limits)?;
         outln!(
             "dwg read (acadrust): {:.1} s; {} source records ({} decoded, {} skipped); {} entities, {} objects, {} table records; {} recovered errors, {} diagnostics",
             p.read_secs,
@@ -614,6 +645,9 @@ fn perf_open(path: &str) -> Result<(), String> {
         for (k, n) in &p.dgn_line_styles_left_out {
             outln!("  left out of the text: {n} {k}");
         }
+        for (k, n) in &p.left_out_with_them {
+            outln!("  left out with them: {n} {k}");
+        }
         for n in &notes {
             outln!("  note: {n}");
         }
@@ -623,7 +657,8 @@ fn perf_open(path: &str) -> Result<(), String> {
         bytes
     };
     let t = Instant::now();
-    let (secs, outside, notes) = cadcraft_io::dxf_sections_noted(&dxf).map_err(|e| e.to_string())?;
+    let options = cadcraft_io::ReadOptions { keep_all };
+    let (secs, outside, left_out) = cadcraft_io::dxf_sections_left_out(&dxf, &options).map_err(|e| e.to_string())?;
     let tags: usize = secs.iter().map(|s| s.tags.len()).sum();
     outln!(
         "dxf groups: {:.1} s; {} groups in {} sections ({:.0} MB as groups, plus their text), {} outside any section; {}",
@@ -634,8 +669,8 @@ fn perf_open(path: &str) -> Result<(), String> {
         outside,
         mem_line()
     );
-    for n in &notes {
-        outln!("  note: {n}");
+    for (k, n) in &left_out.dgn_line_styles {
+        outln!("  stepped over: {n} {k}");
     }
     drop(dxf);
     outln!("after dropping the text: {}", mem_line());
@@ -676,7 +711,7 @@ fn perf_open(path: &str) -> Result<(), String> {
     // The document, phase by phase: each phase's time and the memory when it started.
     let t = Instant::now();
     let mut phases: Vec<(&'static str, Instant, String)> = Vec::new();
-    let d = cadcraft_io::read_dxf_sections_traced(secs, outside, &mut |name| phases.push((name, Instant::now(), mem_line())))
+    let d = cadcraft_io::read_dxf_sections_left_out(secs, outside, &left_out, &mut |name| phases.push((name, Instant::now(), mem_line())))
         .map_err(|e| e.to_string())?;
     outln!(
         "document: {:.1} s; {} entities, {} blocks, {} layers, {} layouts; {}",
@@ -748,7 +783,7 @@ fn perf(args: &[String]) -> Result<(), String> {
     use std::time::Instant;
     if args.iter().any(|a| a == "--open") {
         let path = args.iter().find(|a| !a.starts_with("--")).ok_or("perf --open needs a file")?;
-        return perf_open(path);
+        return perf_open(path, args.iter().any(|a| a == "--keep-all"));
     }
     if let Some(path) = args.first().filter(|a| a.parse::<usize>().is_err()) {
         return perf_file(path);
@@ -1288,6 +1323,42 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `convert` keeps every object the file has only with `--keep-all`: a file with more DGN
+    /// line-style objects than a drawing keeps is written without them otherwise (and warns).
+    #[test]
+    fn convert_keeps_every_object_only_when_asked() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-keep-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let n = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS + 1;
+        let mut dxf = String::from(
+            "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_DGNLINESTYLECOMP\n350\n200\n\
+             0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n",
+        );
+        for i in 0..n {
+            dxf += &format!("3\nLS_{i}\n360\n{:X}\n", 0x1000 + i);
+        }
+        for i in 0..n {
+            dxf += &format!("0\nLSINTERNALCOMPONENT\n5\n{:X}\n330\n200\n100\nAcDbLSInternalComponent\n1\nC{i}\n40\n1.0\n", 0x1000 + i);
+        }
+        dxf += "0\nENDSEC\n0\nEOF\n";
+        std::fs::write(path("in.dxf"), &dxf).unwrap();
+        let count = |n: &str| std::fs::read_to_string(path(n)).unwrap().lines().filter(|l| l.trim() == "LSINTERNALCOMPONENT").count();
+        convert(&a_(&[&path("in.dxf"), &path("lean.dxf")])).unwrap();
+        assert_eq!(count("lean.dxf"), 0);
+        convert(&a_(&[&path("in.dxf"), &path("all.dxf"), "--keep-all"])).unwrap();
+        assert_eq!(count("all.dxf"), n);
+        run(&a_(&[&path("in.dxf"), "--keep-all", "--save", &path("saved.dxf")])).unwrap();
+        assert_eq!(count("saved.dxf"), n);
+        // What OPEN says about it, which convert and --save print as warnings on stderr.
+        let mut s = Session::empty();
+        let r = open_keeping(&mut s, &path("in.dxf"), false).unwrap();
+        assert!(r["warnings"][0].as_str().unwrap_or("").starts_with(&format!("{n} DGN line-style objects were left out")), "{r}");
+        let r = open_keeping(&mut s, &path("in.dxf"), true).unwrap();
+        assert_eq!(r["warnings"], json!([]));
+    }
+
     #[test]
     fn perf_open_reports_the_phases_of_a_file() {
         install_io();
@@ -1295,11 +1366,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("p.dxf").to_string_lossy().to_string();
         run(&a_(&["--sample", "--save", &f])).unwrap();
-        perf_open(&f).unwrap();
+        perf_open(&f, false).unwrap();
         let g = dir.join("p.dwg").to_string_lossy().to_string();
         convert(&a_(&[&f, &g])).unwrap();
-        perf_open(&g).unwrap();
-        assert!(perf_open(&dir.join("nope.dwg").to_string_lossy()).is_err());
+        perf_open(&g, false).unwrap();
+        assert!(perf_open(&dir.join("nope.dwg").to_string_lossy(), false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
