@@ -28,4 +28,13 @@ fn saving_reports_what_the_writer_left_out() {
     // QSAVE goes the same way.
     let r = s.execute("qsave", &json!({ "path": dir.join("b.dwg").to_string_lossy() })).unwrap();
     assert_eq!(r["warnings"].as_array().map(Vec::len), Some(2));
+    // document.bytes (the web's save) says the same as a save to a file: what reading left out,
+    // then what the writer left out. It used to pass on the writer's part alone.
+    let r = s.execute("document.bytes", &json!({ "format": "dwg" })).unwrap();
+    assert_eq!(r["warnings"], json!(["12 things were left out", "The DWG written lacks records the drawing had (ENTITIES: 1 INSERT)."]));
+    let r = s.execute("document.bytes", &json!({ "format": "dxf" })).unwrap();
+    assert_eq!(r["warnings"], json!(["12 things were left out"]));
+    std::sync::Arc::make_mut(&mut s.docs[s.active].doc).read_notes.clear();
+    let r = s.execute("document.bytes", &json!({ "format": "dxf" })).unwrap();
+    assert_eq!(r["warnings"], json!([]));
 }

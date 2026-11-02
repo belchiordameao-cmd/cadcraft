@@ -27,7 +27,13 @@ fn counts(text: &[u8]) -> Option<BTreeMap<&'static str, BTreeMap<String, usize>>
     for s in &parsed.sections {
         let Some(name) = SECTIONS.iter().find(|n| **n == s.name) else { continue };
         let by_type = out.entry(name).or_default();
-        for (kind, _) in cadcraft_dxf::record_slices(&s.tags) {
+        for (kind, tags) in cadcraft_dxf::record_slices(&s.tags) {
+            // An attribute's multiline text is an object embedded in its record (`101`), which
+            // the bridge drops at some versions while keeping the record: counted as a thing of
+            // its own.
+            if tags.iter().any(|t| t.code == 101) {
+                *by_type.entry(format!("{kind} with multiline text")).or_insert(0) += 1;
+            }
             *by_type.entry(kind).or_insert(0) += 1;
         }
     }
@@ -76,6 +82,21 @@ pub(crate) fn dwg_loss(written_from: &[u8], read_back: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::dwg_loss;
+
+    #[test]
+    fn an_attribute_whose_multiline_text_went_is_named() {
+        let mut before = text(&["INSERT", "ATTRIB", "SEQEND"], &[], &[]);
+        let marker = b"0\nATTRIB\n8\n0\n";
+        let at = before.windows(marker.len()).position(|w| w == marker).unwrap() + marker.len();
+        let mut with_text = before.split_off(at);
+        before.extend_from_slice(b"71\n2\n101\nEmbedded Object\n10\n0\n20\n0\n30\n0\n1\nA\\PB\n");
+        before.append(&mut with_text);
+        let after = text(&["INSERT", "ATTRIB", "SEQEND"], &[], &[]);
+        let w = dwg_loss(&before, &after);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("(ENTITIES: 1 ATTRIB with multiline text)"), "{}", w[0]);
+        assert!(dwg_loss(&before, &before).is_empty());
+    }
 
     fn text(entities: &[&str], blocks: &[&str], records: &[&str]) -> Vec<u8> {
         let mut s = String::from("0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nBLOCK_RECORD\n5\n1\n70\n1\n");

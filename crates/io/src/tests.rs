@@ -3027,3 +3027,49 @@ fn pdf_layout_objects_outside_the_sheet_warn() {
     let (_, warnings) = plot_with_warnings(&framed_layout().0, &paper, &serde_json::json!({})).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
 }
+
+/// A block reference repeated 2x2 at spacing 5 with one multiline attribute: the attribute's
+/// text at (0, 2), its embedded multiline text at the same point.
+fn repeated_multiline_attrib() -> Drawing {
+    let mut s = String::new();
+    s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFF\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nBLOCK_RECORD\n5\n1\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nBLOCK_RECORD\n5\n100\n330\n1\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\nTAGBLK\n0\nENDTAB\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n5\n102\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockBegin\n2\nTAGBLK\n70\n2\n10\n0\n20\n0\n30\n0\n3\nTAGBLK\n1\n\n\
+0\nLINE\n5\n104\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbLine\n10\n0\n20\n0\n30\n0\n11\n10\n21\n0\n31\n0\n\
+0\nATTDEF\n5\n105\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbText\n10\n0\n20\n2\n30\n0\n40\n2.5\n1\nX\n100\nAcDbAttributeDefinition\n3\nTag:\n2\nTAG1\n70\n0\n\
+0\nENDBLK\n5\n103\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockEnd\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nENTITIES\n\
+0\nINSERT\n5\n400\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockReference\n66\n1\n2\nTAGBLK\n10\n0\n20\n0\n30\n0\n70\n2\n71\n2\n44\n5\n45\n5\n\
+0\nATTRIB\n5\n401\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbText\n10\n0\n20\n2\n30\n0\n40\n2.5\n1\nVAL\n100\nAcDbAttribute\n2\nTAG1\n70\n0\n\
+71\n2\n72\n1\n11\n0\n21\n2\n31\n0\n101\nEmbedded Object\n10\n0\n20\n2\n30\n0\n40\n2.5\n41\n20\n46\n0\n71\n1\n72\n5\n1\nVAL\\PLINE2\n7\nStandard\n73\n1\n44\n1\n\
+0\nSEQEND\n5\n402\n330\n1F\n100\nAcDbEntity\n8\n0\n0\nENDSEC\n0\nEOF\n";
+    read_dxf(s.as_bytes()).unwrap()
+}
+
+/// The DWG bridge's text has a repeated reference with attributes as one reference per copy:
+/// a multiline attribute's embedded text moves with the copy too (it has an insertion point of
+/// its own, which the copies left at the first copy's).
+#[test]
+fn dwg_bridge_copies_move_a_multiline_attribute_text_along() {
+    let d = repeated_multiline_attrib();
+    let (text, notes) = dxf_write::dwg_bridge(&d, Version::R2013);
+    assert!(notes.is_empty(), "{notes:?}");
+    let tags = cadcraft_dxf::parse_ascii(&text).unwrap();
+    let mut seen = Vec::new();
+    for (kind, rec) in cadcraft_dxf::record_slices(&tags) {
+        if kind != "ATTRIB" {
+            continue;
+        }
+        let marker = rec.iter().position(|t| t.code == 101).expect("a multiline attribute keeps its embedded text");
+        let point = |tags: &[cadcraft_dxf::Tag], code: i32| tags.iter().find(|t| t.code == code).map(|t| t.value.as_f64()).unwrap_or(f64::NAN);
+        let (own, embedded) = (&rec[..marker], &rec[marker + 1..]);
+        let text_at = (point(own, 10), point(own, 20));
+        let embedded_at = (point(embedded, 10), point(embedded, 20));
+        assert_eq!(text_at, embedded_at, "the embedded text sits where the attribute's text does");
+        seen.push(text_at);
+    }
+    seen.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    assert_eq!(seen, vec![(0.0, 2.0), (0.0, 7.0), (5.0, 2.0), (5.0, 7.0)]);
+}
