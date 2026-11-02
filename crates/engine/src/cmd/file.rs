@@ -544,8 +544,12 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = save_options("document.bytes", p)?;
     let version = opts.version.unwrap_or_else(|| drawing_version(s, &format!("drawing.{fmt}")));
     let lost = not_saved_as(s.doc()?, version);
-    let (bytes, _lacks) = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
+    let (bytes, lacks) = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
+    // What the bytes lack of the drawing (a DWG's records the bridge lost), as a save says.
+    if !lacks.is_empty() {
+        r["warnings"] = json!(lacks);
+    }
     if drops_unknown(&format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     }

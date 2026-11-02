@@ -7,10 +7,13 @@
 use std::collections::BTreeMap;
 
 /// Records inside another record (a polyline's vertices, a block reference's attributes, the
-/// end of either) and the records that frame a section's contents: not counted as things on
-/// their own, so that a record written another way (a polyline as a lightweight one) is not
-/// reported as lost, but named when what holds them went.
+/// end of either) and the records that frame a section's contents: not counted as things of
+/// their own, but named when what holds them went.
 const NOT_ON_THEIR_OWN: &[&str] = &["VERTEX", "ATTRIB", "SEQEND", "ENDBLK", "TABLE", "ENDTAB"];
+
+/// Record types the bridge may write one as another of: fewer of one is no loss while the
+/// family has as many (a polyline read back as a lightweight one).
+const SAME_FAMILY: &[&[&str]] = &[&["POLYLINE", "LWPOLYLINE"], &["TEXT", "MTEXT"]];
 
 /// The sections compared: what is drawn and what names it. Objects are not: the bridge adds
 /// and drops dictionaries of its own.
@@ -32,8 +35,10 @@ fn counts(text: &[u8]) -> Option<BTreeMap<&'static str, BTreeMap<String, usize>>
 }
 
 /// The warnings for a DWG whose rendition `read_back` (the bridge's DXF text of the file
-/// written) has fewer records than `written_from` (the text it was written from): one per
-/// section that lost records of their own, naming every type with fewer records.
+/// written) has fewer records than `written_from` (the text it was written from): one warning,
+/// naming each section with fewer records of some type (type by type, so that a record the
+/// bridge adds elsewhere in the section hides nothing; a type written as another of its family
+/// is no loss), with every type that has fewer, sub-records included.
 pub(crate) fn dwg_loss(written_from: &[u8], read_back: &[u8]) -> Vec<String> {
     let (Some(before), Some(after)) = (counts(written_from), counts(read_back)) else {
         return vec!["The DWG written could not be counted against the drawing: whether it kept everything is not known.".into()];
@@ -41,15 +46,20 @@ pub(crate) fn dwg_loss(written_from: &[u8], read_back: &[u8]) -> Vec<String> {
     let mut lines = Vec::new();
     for section in SECTIONS {
         let (Some(b), a) = (before.get(section), after.get(section).cloned().unwrap_or_default()) else { continue };
-        let own = |m: &BTreeMap<String, usize>| m.iter().filter(|(k, _)| !NOT_ON_THEIR_OWN.contains(&k.as_str())).map(|(_, n)| n).sum::<usize>();
-        if own(b) <= own(&a) {
+        let n = |m: &BTreeMap<String, usize>, k: &str| m.get(k).copied().unwrap_or(0);
+        let family_lost = |k: &str| match SAME_FAMILY.iter().find(|f| f.contains(&k)) {
+            Some(f) => f.iter().map(|t| n(b, t)).sum::<usize>() > f.iter().map(|t| n(&a, t)).sum::<usize>(),
+            None => true,
+        };
+        let lost_own = b.iter().any(|(k, c)| !NOT_ON_THEIR_OWN.contains(&k.as_str()) && *c > n(&a, k) && family_lost(k));
+        if !lost_own {
             continue;
         }
         let fewer: Vec<String> = b
             .iter()
-            .filter_map(|(k, n)| {
-                let lost = n.saturating_sub(a.get(k).copied().unwrap_or(0));
-                (lost > 0).then(|| format!("{lost} {k}"))
+            .filter_map(|(k, c)| {
+                let lost = c.saturating_sub(n(&a, k));
+                (lost > 0 && (NOT_ON_THEIR_OWN.contains(&k.as_str()) || family_lost(k))).then(|| format!("{lost} {k}"))
             })
             .collect();
         lines.push(format!("{section}: {}", fewer.join(", ")));
@@ -57,7 +67,10 @@ pub(crate) fn dwg_loss(written_from: &[u8], read_back: &[u8]) -> Vec<String> {
     if lines.is_empty() {
         return Vec::new();
     }
-    vec![format!("The DWG written lacks records the drawing had; the DWG writer left them out ({}). Saving as DXF keeps them.", lines.join("; "))]
+    vec![format!(
+        "The DWG written, read back, lacks records the drawing had ({}): the DWG bridge lost them, writing or reading them. Saving as DXF keeps them.",
+        lines.join("; ")
+    )]
 }
 
 #[cfg(test)]
@@ -89,8 +102,9 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!(
             w[0],
-            "The DWG written lacks records the drawing had; the DWG writer left them out \
-             (ENTITIES: 1 ATTRIB, 1 INSERT, 1 SEQEND; BLOCKS: 1 BLOCK, 1 ENDBLK, 1 LINE; TABLES: 1 BLOCK_RECORD). Saving as DXF keeps them."
+            "The DWG written, read back, lacks records the drawing had \
+             (ENTITIES: 1 ATTRIB, 1 INSERT, 1 SEQEND; BLOCKS: 1 BLOCK, 1 ENDBLK, 1 LINE; TABLES: 1 BLOCK_RECORD): \
+             the DWG bridge lost them, writing or reading them. Saving as DXF keeps them."
         );
     }
 
@@ -104,6 +118,16 @@ mod tests {
         // Anonymous blocks renumbered by the bridge: the same count of blocks.
         let renamed = text(&["LINE", "POLYLINE", "VERTEX", "VERTEX", "SEQEND"], &["*U0"], &["*U0"]);
         assert!(dwg_loss(&before, &renamed).is_empty());
+    }
+
+    /// A record the bridge adds hides nothing: the count is type by type, not the section's.
+    #[test]
+    fn a_record_added_elsewhere_in_the_section_hides_no_loss() {
+        let before = text(&["LINE", "INSERT", "ATTRIB", "SEQEND"], &[], &[]);
+        let after = text(&["LINE", "VIEWPORT", "VIEWPORT", "VIEWPORT"], &[], &[]);
+        let w = dwg_loss(&before, &after);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("(ENTITIES: 1 ATTRIB, 1 INSERT, 1 SEQEND)"), "{}", w[0]);
     }
 
     #[test]

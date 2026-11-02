@@ -130,6 +130,9 @@ struct Ctx {
     /// The version the file ends up in (the DWG version for a DWG save): it decides which
     /// entity types exist (MULTILEADER from 2007).
     target: Version,
+    /// The text is for the DWG bridge (acadrust), whose reader has its quirks (see the INSERT
+    /// arm of [`entity_tags`]); a DXF file is written as the drawing is.
+    bridge: bool,
 }
 
 impl Ctx {
@@ -745,48 +748,87 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             w.t.extend(crate::dxf_read::mtext_dxf::column_tags(t));
         }
         EntityKind::Insert(i) => {
-            w.s(0, "INSERT");
-            common(w, e, owner, paper, "AcDbBlockReference");
-            if !i.attribs.is_empty() {
-                w.i(66, 1);
-            }
-            w.s(2, &i.block);
-            w.p(10, i.insert);
-            w.f(41, i.scale.x);
-            w.f(42, i.scale.y);
-            w.f(43, i.scale.z);
-            w.f(50, i.rotation.to_degrees());
-            if i.cols > 1 || i.rows > 1 {
-                w.i(70, i64::from(i.cols));
-                w.i(71, i64::from(i.rows));
-                w.f(44, i.col_spacing);
-                w.f(45, i.row_spacing);
-            }
-            if !i.attribs.is_empty() {
-                for a in &i.attribs {
-                    let ah = w.h();
-                    w.s(0, "ATTRIB");
-                    w.s(5, ah);
-                    w.s(330, e.handle.hex());
-                    w.s(100, "AcDbEntity");
-                    let (c, base) = attrib_common(d, e, i, a);
-                    layer_and_props(w, &c, Some(&base));
-                    // Hidden with its definition (a dynamic block's visibility state hides it).
-                    if !base.visible {
-                        w.i(60, 1);
-                    }
-                    w.s(100, "AcDbText");
-                    text_tags(w, &a.text, Some((a, cx.target)), None);
-                    if cx.target >= Version::R2007 {
-                        multiline_tags(w, a, false);
-                    }
+            // The DWG bridge (acadrust 0.6.4) loses a block reference repeated in columns or rows
+            // when it has attributes: its reader takes the array sizes from where its writer put
+            // the count of owned attributes (2004 and later), and skips the record or reads the
+            // array wrong. The bridge gets one plain reference per copy, each with the attributes
+            // moved along, which draws the same; a DXF file keeps the one reference.
+            let copies: Vec<Vec3> = if cx.bridge && !i.attribs.is_empty() && (i.cols > 1 || i.rows > 1) {
+                let (cols, rows) = (i.cols.clamp(1, 10_000), i.rows.clamp(1, 10_000));
+                (0..rows)
+                    .flat_map(|r| (0..cols).map(move |c| (c, r)))
+                    .map(|(c, r)| {
+                        let off = Vec2::new(i.col_spacing * f64::from(c), i.row_spacing * f64::from(r)).rotate(i.rotation);
+                        Vec3::new(off.x, off.y, 0.0)
+                    })
+                    .collect()
+            } else {
+                vec![Vec3::new(0.0, 0.0, 0.0)]
+            };
+            let as_array = copies.len() == 1 && (i.cols > 1 || i.rows > 1);
+            for (k, off) in copies.iter().enumerate() {
+                // The first copy is the reference itself; the others get handles of their own.
+                let own;
+                let ec: &Entity = if k == 0 {
+                    e
+                } else {
+                    let handle = Handle::parse_hex(&w.h()).unwrap_or(e.handle);
+                    own = Entity { handle, common: e.common.clone(), kind: e.kind.clone() };
+                    &own
+                };
+                w.s(0, "INSERT");
+                common(w, ec, owner, paper, "AcDbBlockReference");
+                if !i.attribs.is_empty() {
+                    w.i(66, 1);
                 }
-                let sh = w.h();
-                w.s(0, "SEQEND");
-                w.s(5, sh);
-                w.s(330, e.handle.hex());
-                w.s(100, "AcDbEntity");
-                w.s(8, &e.common.layer);
+                w.s(2, &i.block);
+                w.p(10, i.insert + *off);
+                w.f(41, i.scale.x);
+                w.f(42, i.scale.y);
+                w.f(43, i.scale.z);
+                w.f(50, i.rotation.to_degrees());
+                if as_array {
+                    w.i(70, i64::from(i.cols));
+                    w.i(71, i64::from(i.rows));
+                    w.f(44, i.col_spacing);
+                    w.f(45, i.row_spacing);
+                }
+                if !i.attribs.is_empty() {
+                    for a in &i.attribs {
+                        let moved;
+                        let a: &Attrib = if k == 0 {
+                            a
+                        } else {
+                            let mut t = a.text.clone();
+                            t.insert = t.insert + *off;
+                            t.align_pt = t.align_pt.map(|p| p + *off);
+                            moved = Attrib { text: t, ..a.clone() };
+                            &moved
+                        };
+                        let ah = w.h();
+                        w.s(0, "ATTRIB");
+                        w.s(5, ah);
+                        w.s(330, ec.handle.hex());
+                        w.s(100, "AcDbEntity");
+                        let (c, base) = attrib_common(d, ec, i, a);
+                        layer_and_props(w, &c, Some(&base));
+                        // Hidden with its definition (a dynamic block's visibility state hides it).
+                        if !base.visible {
+                            w.i(60, 1);
+                        }
+                        w.s(100, "AcDbText");
+                        text_tags(w, &a.text, Some((a, cx.target)), None);
+                        if cx.target >= Version::R2007 {
+                            multiline_tags(w, a, false);
+                        }
+                    }
+                    let sh = w.h();
+                    w.s(0, "SEQEND");
+                    w.s(5, sh);
+                    w.s(330, ec.handle.hex());
+                    w.s(100, "AcDbEntity");
+                    w.s(8, &e.common.layer);
+                }
             }
         }
         EntityKind::Dimension(dm) => {
@@ -1551,13 +1593,13 @@ pub fn write(d: &Drawing) -> String {
 
 /// The drawing's DXF tags, declaring `version` in `$ACADVER`.
 pub fn tags(d: &Drawing, version: Version) -> Vec<Tag> {
-    tags_for(d, version, version)
+    tags_for(d, version, version, false)
 }
 
 /// The R2000 DXF the DWG bridge converts to a `dwg` version DWG: its entity types are the DWG
 /// version's (MULTILEADER from 2007).
 pub(crate) fn dwg_bridge(d: &Drawing, dwg: Version) -> String {
-    let mut tags = tags_for(d, Version::R2000, dwg);
+    let mut tags = tags_for(d, Version::R2000, dwg, true);
     bridge_markers(&mut tags);
     cadcraft_dxf::write_ascii(&tags)
 }
@@ -1576,7 +1618,7 @@ fn bridge_markers(tags: &mut [Tag]) {
 
 /// The drawing's DXF tags, declaring `version` in `$ACADVER`, with what `target` (the version the
 /// file ends up in: `version`, or the DWG version the bridge writes) has.
-fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
+fn tags_for(d: &Drawing, version: Version, target: Version, bridge: bool) -> Vec<Tag> {
     // An in-place block edit in progress is not written: the drawing as before it.
     let committed = d.committed();
     let d: &Drawing = &committed;
@@ -1610,7 +1652,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         .collect();
     user_blocks.iter_mut().for_each(|b| b.1 = format!("{:X}", 0));
     let user_blocks: Vec<(String, String, &Block)> = user_blocks.into_iter().map(|(n, _, b)| (n, w.h(), b)).collect();
-    let mut cx = Ctx { paper_views: paper_views(d), target, ..Ctx::default() };
+    let mut cx = Ctx { paper_views: paper_views(d), target, bridge, ..Ctx::default() };
     cx.block_records = user_blocks.iter().map(|(n, h, _)| (n.to_ascii_uppercase(), h.clone())).collect();
     // Dimension blocks.
     let mut dim_defs: Vec<(String, String, Vec<Entity>)> = Vec::new(); // filled below
