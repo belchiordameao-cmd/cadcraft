@@ -2698,3 +2698,16 @@ fn pdf_layout_fit_option_fits_the_contents_whatever_the_page_setup_says() {
     assert!(near(b.min.x, cx - 160.0 * s * k) && near(b.max.x, cx + 160.0 * s * k), "{b:?}");
     assert!(near(b.min.y, cy - 115.0 * s * k) && near(b.max.y, cy + 115.0 * s * k), "{b:?}");
 }
+
+#[test]
+fn large_pdf_streams_compress_at_the_fast_level_and_inflate_back() {
+    // 9 MB of content-stream-like text: compressed at the fast level, still a valid Flate stream.
+    let line = b"123.456 789.012 m 345.678 901.234 l S\n";
+    let data: Vec<u8> = line.iter().copied().cycle().take(9 << 20).collect();
+    let body = crate::pdf::stream_for_test(&data, true);
+    let start = body.windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+    let end = body.len() - b"\nendstream".len();
+    let back = miniz_oxide::inflate::decompress_to_vec_zlib(&body[start..end]).unwrap();
+    assert_eq!(back, data);
+    assert!(body.len() < data.len() / 10, "{} bytes", body.len());
+}

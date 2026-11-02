@@ -986,13 +986,26 @@ fn uri_string(url: &str) -> Option<String> {
     Some(out)
 }
 
+/// Streams larger than this compress at a faster level: a large drawing's content stream
+/// takes seconds at the default level for a few per cent of size (measured: 167 MB in 11.4 s
+/// at level 6 to 38 MB, 3.7 s at level 3 to 40 MB).
+const FAST_COMPRESSION_FROM: usize = 8 << 20;
+
 /// A stream object body, Flate-compressed when asked.
 fn stream(data: &[u8], compress: bool, extra: &str) -> Vec<u8> {
-    let (data, filter) = if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, 6), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
+    let level = if data.len() >= FAST_COMPRESSION_FROM { 3 } else { 6 };
+    let (data, filter) =
+        if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, level), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
     let mut out = format!("<< /Length {}{filter}{extra} >>\nstream\n", data.len()).into_bytes();
     out.extend_from_slice(&data);
     out.extend_from_slice(b"\nendstream");
     out
+}
+
+/// [`stream`] for the crate's tests.
+#[cfg(test)]
+pub(crate) fn stream_for_test(data: &[u8], compress: bool) -> Vec<u8> {
+    stream(data, compress, "")
 }
 
 /// PDF objects being written: bodies by object number - 1.

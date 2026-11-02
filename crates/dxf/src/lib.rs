@@ -273,9 +273,9 @@ fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
         }
         let code: i32 = ct.parse().map_err(|_| DxfError::BadCode { line: ln + 1, text: ct.chars().take(40).collect() })?;
         let Some((_, val)) = lines.next() else { return Err(DxfError::Eof) };
-        let v = typed(code, val);
-        let v = match v {
-            Value::Str(s) => Value::Str(unescape_unicode(&s)),
+        // Unicode escapes are rare: only a string that has one is rebuilt.
+        let v = match typed(code, val) {
+            Value::Str(s) if s.contains("\\U+") || s.contains("\\M+") => Value::Str(unescape_unicode(&s)),
             o => o,
         };
         tags.push(Tag { code, value: v });
@@ -552,6 +552,55 @@ pub fn sections(tags: &[Tag]) -> Vec<Section> {
     out
 }
 
+/// Split a tag stream into sections, moving the tags instead of copying them: a large file's
+/// tags are held once, by its sections. Tags outside any section are dropped.
+pub fn into_sections(mut tags: Vec<Tag>) -> Vec<Section> {
+    let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < tags.len() {
+        let is_sec = tags.get(i).is_some_and(|t| t.code == 0 && t.str() == "SECTION");
+        if is_sec {
+            let name = tags.get(i + 1).filter(|t| t.code == 2).map(Tag::str).unwrap_or_default();
+            let start = (i + 2).min(tags.len());
+            let mut j = start;
+            while j < tags.len() && !(tags.get(j).is_some_and(|t| t.code == 0 && t.str() == "ENDSEC")) {
+                j += 1;
+            }
+            spans.push((name, start, j));
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    // The last section is moved out first, so that the earlier spans stay where they are and
+    // each drain shifts only the few tags after the section.
+    let mut out: Vec<Section> = Vec::with_capacity(spans.len());
+    for (name, start, end) in spans.into_iter().rev() {
+        let sec: Vec<Tag> = tags.drain(start..end).collect();
+        out.push(Section { name, tags: sec });
+    }
+    out.reverse();
+    out
+}
+
+/// [`records`] without copying: (type, the tags after its code-0 tag) as slices of `tags`.
+pub fn record_slices(tags: &[Tag]) -> Vec<(String, &[Tag])> {
+    let mut out: Vec<(String, &[Tag])> = Vec::new();
+    let mut start = None;
+    for (i, t) in tags.iter().enumerate() {
+        if t.code == 0 {
+            if let Some((s, kind)) = start.take() {
+                out.push((kind, tags.get(s..i).unwrap_or(&[])));
+            }
+            start = Some((i + 1, t.str()));
+        }
+    }
+    if let Some((s, kind)) = start {
+        out.push((kind, tags.get(s..).unwrap_or(&[])));
+    }
+    out
+}
+
 /// Split a run of tags into records starting at each code-0 tag: (type, tags after the 0).
 pub fn records(tags: &[Tag]) -> Vec<(String, Vec<Tag>)> {
     let mut out: Vec<(String, Vec<Tag>)> = Vec::new();
@@ -568,6 +617,30 @@ pub fn records(tags: &[Tag]) -> Vec<(String, Vec<Tag>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_sections_and_record_slices_match_the_copying_splitters() {
+        let text = "0\nSECTION\n2\nHEADER\n9\n$X\n70\n1\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n1.5\n0\nCIRCLE\n8\nA\n40\n2\n0\nENDSEC\n0\nEOF\n";
+        let tags = parse_ascii(text).unwrap();
+        let copied = sections(&tags);
+        let moved = into_sections(tags.clone());
+        assert_eq!(copied.len(), moved.len());
+        for (a, b) in copied.iter().zip(&moved) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.tags, b.tags);
+        }
+        let ents = &moved[1].tags;
+        let slices = record_slices(ents);
+        let owned = records(ents);
+        assert_eq!(slices.len(), owned.len());
+        for ((k1, t1), (k2, t2)) in slices.iter().zip(&owned) {
+            assert_eq!(k1, k2);
+            assert_eq!(*t1, t2.as_slice());
+        }
+        assert_eq!(slices[0].0, "LINE");
+        assert_eq!(slices[1].1.len(), 2);
+        assert!(record_slices(&[]).is_empty());
+    }
 
     #[test]
     fn ascii_roundtrip() {
