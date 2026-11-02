@@ -58,6 +58,7 @@ fn stdout_failed(e: std::io::Error) {
 const USAGE: &str = "usage:
   cadcraft-cli info FILE.dxf
   cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING]
+  cadcraft-cli info FILE --layouts   page setup + viewport fields of every layout (diagnostics)
   cadcraft-cli convert IN.dxf OUT.pdf --layout NAME [--layout NAME2]... | --layout all
                            plot paper-space layouts at their page setup (paper, scale, plot
                            area); several layouts write OUT-<layout>.pdf each.
@@ -212,10 +213,41 @@ fn validate_options(command: &str, args: &[String], specs: &[OptionSpec]) -> Res
 }
 
 const NO_OPTIONS: &[OptionSpec] = &[];
+const INFO_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--layouts", takes_value: false }];
 
-fn info(path: &str) -> Result<(), String> {
+/// `info FILE --layouts`: per-layout page setup and viewport fields, for diagnosing a sheet
+/// that plots at the wrong size or with empty viewports (no drawing content is printed).
+fn layouts_report(s: &Session) -> Result<Value, String> {
+    let d = s.doc().map_err(|e| e.to_string())?;
+    let layouts: Vec<Value> = d
+        .layouts
+        .iter()
+        .map(|l| {
+            let viewports: Vec<Value> = l
+                .entities
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    cadcraft_engine::doc::EntityKind::Viewport(v) => Some(json!({
+                        "id": v.id, "on": v.on, "center": v.center, "width": v.width, "height": v.height,
+                        "view_center": v.view_center, "view_height": v.view_height,
+                        "frozen_layers": v.frozen_layers, "clipped": v.clip.is_some(),
+                    })),
+                    _ => None,
+                })
+                .collect();
+            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "viewports": viewports })
+        })
+        .collect();
+    Ok(json!({ "layouts": layouts }))
+}
+
+fn info(path: &str, layouts: bool) -> Result<(), String> {
     let mut s = Session::empty();
     open(&mut s, path)?;
+    if layouts {
+        outln!("{}", serde_json::to_string_pretty(&layouts_report(&s)?).unwrap_or_default());
+        return Ok(());
+    }
     let v = s.execute("drawing.inspect", &json!({ "entities": false })).map_err(|e| e.to_string())?;
     outln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     Ok(())
@@ -699,7 +731,9 @@ fn cli() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let r = match args.first().map(String::as_str) {
-        Some("info") => validate_options("info", &rest, NO_OPTIONS).and_then(|_| rest.first().ok_or_else(|| USAGE.to_string())).and_then(|p| info(p)),
+        Some("info") => validate_options("info", &rest, INFO_OPTIONS)
+            .and_then(|_| rest.iter().find(|a| !a.starts_with("--")).ok_or_else(|| USAGE.to_string()))
+            .and_then(|p| info(p, rest.iter().any(|a| a == "--layouts"))),
         Some("convert") => convert(&rest),
         Some("run") => run(&rest),
         Some("perf") => validate_options("perf", &rest, NO_OPTIONS).and_then(|_| perf(&rest)),
@@ -950,6 +984,24 @@ mod tests {
         let (e, v) = (std::fs::read(path("e.pdf")).unwrap(), std::fs::read(path("v.pdf")).unwrap());
         assert!(v.len() > e.len(), "viewport content missing: empty {} bytes, with viewport {} bytes", e.len(), v.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn info_layouts_reports_page_setup_and_viewports() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-infolayouts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("in.dxf").to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        run(&a(&["--sample", "--cmd", r#"layout.new {"name":"S"}"#, "--cmd", r#"mview {"layout":"S","p1":[10,10],"p2":[200,150]}"#, "--save", &f]))
+            .unwrap();
+        let mut s = Session::empty();
+        open(&mut s, &f).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = layouts_report(&s).unwrap();
+        let l = r["layouts"].as_array().unwrap().iter().find(|l| l["name"] == "S").unwrap();
+        assert!(!l["viewports"].as_array().unwrap().is_empty());
+        assert!(l["page"]["width_mm"].as_f64().unwrap() > 0.0);
     }
 
     fn args(values: &[&str]) -> Vec<String> {
