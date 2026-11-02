@@ -275,6 +275,8 @@ trait Sink {
     fn skipping(&self) -> bool {
         false
     }
+    /// The handle (group 5) of a record that is left out, as it goes by.
+    fn skipped_handle(&mut self, _handle: &str) {}
 }
 
 impl Sink for Vec<Tag> {
@@ -302,6 +304,9 @@ fn parse_ascii_into(text: &str, max_tags: usize, sink: &mut impl Sink) -> Result
             return Err(DxfError::TooLarge { tags: n, limit: max_tags });
         }
         if code != 0 && sink.skipping() {
+            if code == 5 {
+                sink.skipped_handle(val.trim());
+            }
             continue;
         }
         // Unicode escapes are rare: only a string that has one is rebuilt.
@@ -401,7 +406,10 @@ fn parse_binary_into(b: &[u8], max_tags: usize, sink: &mut impl Sink) -> Result<
             // Step over the value.
             match kind_of(code) {
                 Kind::Str => {
-                    c.cstr()?;
+                    let s = c.cstr()?;
+                    if code == 5 {
+                        sink.skipped_handle(String::from_utf8_lossy(s).trim());
+                    }
                 }
                 Kind::Real => {
                     c.f64()?;
@@ -657,6 +665,8 @@ pub struct Parsed {
     pub outside: usize,
     /// Records left out, by type in the order the types were first met, with how many of each.
     pub skipped: Vec<(String, usize)>,
+    /// The handles (group 5, upper case) of the records left out, for what they owned.
+    pub skipped_handles: Vec<String>,
 }
 
 /// The sections as [`parse_sections`] builds them: each group goes into the section it belongs
@@ -673,11 +683,21 @@ struct SectionSink<'a> {
     outside: usize,
     skip: &'a dyn Fn(&str) -> bool,
     skipped: Vec<(String, usize)>,
+    skipped_handles: Vec<String>,
 }
 
 impl<'a> SectionSink<'a> {
     fn new(skip: &'a dyn Fn(&str) -> bool) -> Self {
-        SectionSink { sections: Vec::new(), open: None, naming: false, skipping: false, outside: 0, skip, skipped: Vec::new() }
+        SectionSink {
+            sections: Vec::new(),
+            open: None,
+            naming: false,
+            skipping: false,
+            outside: 0,
+            skip,
+            skipped: Vec::new(),
+            skipped_handles: Vec::new(),
+        }
     }
 
     fn finish(mut self) -> Parsed {
@@ -685,13 +705,17 @@ impl<'a> SectionSink<'a> {
         if let Some(s) = self.open.take() {
             self.sections.push(s);
         }
-        Parsed { sections: self.sections, outside: self.outside, skipped: self.skipped }
+        Parsed { sections: self.sections, outside: self.outside, skipped: self.skipped, skipped_handles: self.skipped_handles }
     }
 }
 
 impl Sink for SectionSink<'_> {
     fn skipping(&self) -> bool {
         self.skipping
+    }
+
+    fn skipped_handle(&mut self, handle: &str) {
+        self.skipped_handles.push(handle.to_ascii_uppercase());
     }
 
     fn take(&mut self, t: Tag) {
@@ -867,6 +891,7 @@ mod tests {
             assert_eq!(kinds, ["DICTIONARY", "XRECORD"]);
             assert_eq!(p.sections[0].tags.len(), 1 + 3 + 1 + 1);
             assert_eq!(p.skipped, vec![("LSINTERNALCOMPONENT".to_string(), 2), ("LSDEFINITION".to_string(), 1)]);
+            assert_eq!(p.skipped_handles, ["D", "F", "10"]);
             // The limit counts the skipped groups too: the file is what it is.
             let n = tags.len();
             assert!(parse_sections_with_limit(&bytes, n - 1, &skip).is_err());

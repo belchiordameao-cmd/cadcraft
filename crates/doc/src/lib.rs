@@ -107,6 +107,10 @@ pub struct Drawing {
     /// Plot style tables kept with the drawing (STYLESMANAGER); they shadow built-in tables of
     /// the same name.
     pub plot_style_tables: Vec<PlotStyleTable>,
+    /// The named plot styles the drawing declares (its `ACAD_PLOTSTYLENAME` dictionary), in
+    /// order, whether or not a layer or object uses them; a file written has them all, with
+    /// Normal and the names in use. A named-plot-style drawing keeps its styles that way.
+    pub plot_style_names: Vec<String>,
     /// Parametric constraints (GEOMCONSTRAINT / DIMCONSTRAINT).
     pub constraints: Vec<Constraint>,
     /// User parameters and parametric settings.
@@ -175,6 +179,7 @@ impl Drawing {
             layer_states: Vec::new(),
             groups: Vec::new(),
             plot_style_tables: Vec::new(),
+            plot_style_names: Vec::new(),
             constraints: Vec::new(),
             parametric: Parametric::default(),
             scales: imperial_scales(),
