@@ -1,8 +1,11 @@
 //! Vector PDF plotting (PLOT / EXPORTPDF): a minimal PDF writer of our own (pure Rust, no file
 //! access, so it runs on the web too).
 //!
-//! One page per sheet: model-space extents fitted to a sheet, or a layout at 1:1 (or the given
-//! `scale`) on its paper (paper units are millimetres in metric drawings, inches otherwise).
+//! One page per sheet: model-space extents fitted to a sheet, or a layout on its paper as its
+//! page setup says: the whole sheet at its plot scale (plot area `layout`, paper point (0, 0) at
+//! the printable area's corner, as in AutoCAD), or its paper-space extents scaled to fit or at
+//! the plot scale, centred or from the plot origin (`extents`). Paper units are millimetres in
+//! metric drawings, inches otherwise.
 //! Lines are stroked paths (`m`/`l`/`S`), fills are `f` paths, colours are RGB with colour 7 printing black on white
 //! paper, and line widths come from lineweights when enabled. The page setup's plot style
 //! table (or the `plotStyleTable` option) sets the printed colours, linetypes and lineweights.
@@ -83,6 +86,9 @@ pub struct PdfOptions {
     /// Plot objects with their transparency (PDF alpha). `None` = the page setup's "Plot
     /// transparency" (off for model space).
     pub plot_transparency: Option<bool>,
+    /// Folder raster images with a relative (or not found) path are looked for in: the
+    /// drawing's folder. Images that cannot be read plot as their placeholder.
+    pub image_dir: Option<String>,
 }
 
 impl Default for PdfOptions {
@@ -107,6 +113,7 @@ impl Default for PdfOptions {
             margins: None,
             hyperlinks: true,
             plot_transparency: None,
+            image_dir: None,
         }
     }
 }
@@ -143,6 +150,7 @@ impl PdfOptions {
             margins: margins(v.get("margins")),
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
+            image_dir: v.get("imageDir").and_then(Value::as_str).map(str::to_string),
         }
     }
 }
@@ -199,6 +207,11 @@ fn window(v: Option<&Value>) -> Option<Bounds2> {
 
 /// Plot with JSON options (the engine's `plot` hook).
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
+    plot_with_warnings(d, space, opts).map(|(bytes, _)| bytes)
+}
+
+/// [`plot`], also returning the warnings of the plot (see [`pdf_sheets_with_warnings`]).
+pub fn plot_with_warnings(d: &Drawing, space: &Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>)> {
     validate_plot_offset_json(opts)?;
     // `layouts: [name | "Model"] | "all"` plots those sheets into one file, one page each,
     // instead of `space`; "all" = Model if it has objects, then the layouts in tab order.
@@ -217,7 +230,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                 let mut po = PdfOptions::from_json(&serde_json::json!({
                     "paper": pg.get("paper"), "landscape": pg.get("landscape"), "scale": pg.get("scale"),
                     "plotStyleTable": opts.get("plotStyleTable"), "lineweights": opts.get("lineweights"),
-                    "margins": opts.get("margins"), "text": opts.get("text"),
+                    "margins": opts.get("margins"), "text": opts.get("text"), "imageDir": opts.get("imageDir"),
                 }));
                 po.window = Some(w);
                 po.fit = Some(true);
@@ -225,7 +238,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
-        return pdf_items(d, &items, &o);
+        return pdf_items_with_warnings(d, &items, &o);
     }
     match opts.get("layouts") {
         Some(Value::String(a)) if a.eq_ignore_ascii_case("all") => {
@@ -233,7 +246,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
             layouts.sort_by_key(|l| l.tab_order);
             let model = (!d.model.is_empty()).then_some(Space::Model);
             let spaces: Vec<Space> = model.into_iter().chain(layouts.iter().map(|l| Space::Paper(l.name.clone()))).collect();
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_warnings(d, &spaces, &o)
         }
         Some(v) => {
             let names = v.as_array().ok_or_else(|| IoError::Format("`layouts` must be a list of layout names".into()))?;
@@ -248,9 +261,9 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                     None => Err(IoError::Format("`layouts` must be a list of layout names".into())),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_warnings(d, &spaces, &o)
         }
-        None => pdf(d, space, &o),
+        None => pdf_sheets_with_warnings(d, std::slice::from_ref(space), &o),
     }
 }
 
@@ -310,19 +323,22 @@ pub fn page_for(d: &Drawing, space: &Space, o: &PdfOptions) -> Result<PageSetup>
     Ok(page)
 }
 
-/// World → paper-unit mapping: `p' = (p - from) * s + to`.
+/// World → page mapping: the paper point `(p - from) * s + to`, measured from the sheet's
+/// lower-left corner (`origin`, a margin below and left of the paper-space origin), in points.
 #[derive(Clone, Copy)]
 struct Map {
     from: Vec2,
     s: f64,
     to: Vec2,
+    /// The sheet's lower-left corner in paper units ([`Sheet::origin`]).
+    origin: Vec2,
     /// Points per paper unit.
     k: f64,
 }
 
 impl Map {
     fn pt(&self, p: Vec2) -> Vec2 {
-        ((p - self.from) * self.s + self.to) * self.k
+        ((p - self.from) * self.s + self.to - self.origin) * self.k
     }
 }
 
@@ -339,14 +355,25 @@ fn sheet_name(space: &Space) -> String {
 /// Write a vector PDF with one page per space (at most [`MAX_PAGES`]), each labelled with its
 /// layout name. The options apply to every sheet; layouts use their own page setups.
 pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_sheets_with_warnings(d, spaces, o).map(|(bytes, _)| bytes)
+}
+
+/// [`pdf_sheets`], also returning the warnings of the plot: a page that comes out blank because
+/// its page setup's window or its objects lie elsewhere, and what was done about it.
+pub fn pdf_sheets_with_warnings(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<(Vec<u8>, Vec<String>)> {
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), o.clone())).collect();
-    pdf_items(d, &items, o)
+    pdf_items_with_warnings(d, &items, o)
 }
 
 /// Write a vector PDF with one page per `(space, options)` item (at most [`MAX_PAGES`]): each
 /// page plots with its own options (window, paper, orientation); `o` supplies the file-wide
 /// ones (compression, title, layers, links).
 pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_items_with_warnings(d, items, o).map(|(bytes, _)| bytes)
+}
+
+/// [`pdf_items`], also returning the warnings of the plot (see [`pdf_sheets_with_warnings`]).
+pub fn pdf_items_with_warnings(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<(Vec<u8>, Vec<String>)> {
     if items.iter().any(|(_, io)| io.offset.is_some_and(|offset| !valid_plot_offset(offset))) {
         return Err(IoError::Format("plot offset must contain two finite values within ±100000 mm".into()));
     }
@@ -369,10 +396,16 @@ pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> 
         d
     };
     let links = all_links(d, o);
-    let pages = items.iter().map(|(s, po)| sheet(drawn, s, po, &links)).collect::<Result<Vec<_>>>()?;
+    let mut warnings = Vec::new();
+    let mut pages = Vec::with_capacity(items.len());
+    for (s, po) in items {
+        let (page, w) = sheet(drawn, s, po, &links)?;
+        pages.push(page);
+        warnings.extend(w);
+    }
     let title = if o.title.is_empty() { pages.first().map(|p| p.label.clone()).unwrap_or_default() } else { o.title.clone() };
     let fonts = if o.text_as_geometry { fonts::Fonts::default() } else { fonts::Fonts::collect(pages.iter().map(|p| &p.list)) };
-    Ok(assemble(d, &pages, &fonts, o, &title))
+    Ok((assemble(d, &pages, &fonts, o, &title), warnings))
 }
 
 /// One plotted sheet, ready to be written as a page.
@@ -392,9 +425,9 @@ struct SheetPage {
 }
 
 /// Plot one space.
-fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<SheetPage> {
+fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<(SheetPage, Vec<String>)> {
     let page = page_for(d, space, o)?;
-    let unit_mm = paper::paper_unit_mm(d);
+    let unit_mm = paper::page_unit_mm(d, &page);
     let sheet = Sheet::from_page(&page, unit_mm);
     let lineweights = o.lineweights.unwrap_or(if space.is_paper() { page.lineweights } else { true });
     let plot_style_table = cadcraft_doc::plot_style_table(d, &page.plot_style_table).map(std::sync::Arc::new);
@@ -412,32 +445,92 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         cancel: None,
     };
     let k = unit_mm * PT_PER_MM;
-    let window = o.window.filter(|w| matches!(space, Space::Model) && !w.is_empty());
-    let fit = o.fit.unwrap_or(window.is_some() || matches!(space, Space::Model));
+    let model = matches!(space, Space::Model);
+    let window = o.window.filter(|w| model && !w.is_empty());
+    // Model space fits its extents (or the window) to the printable area. A layout plots as its
+    // page setup says: plot area `layout` (the default) is the whole sheet with paper point
+    // (0, 0) at the printable corner, at the plot scale; `extents` is the paper-space extents
+    // and `window` the saved window, fitted to the printable area (or at the plot scale),
+    // centred when the setup says so, else from the plot origin. `display` and `limits`, whose
+    // frames are not kept, plot like `layout`. The `fit` option asked for explicitly fits the
+    // paper-space extents (or the window) whatever the setup says, centred.
+    let forced_fit = !model && o.fit == Some(true);
+    let mut paper_window = (!model && page.plot_area.eq_ignore_ascii_case("window"))
+        .then_some(page.window)
+        .flatten()
+        .filter(|w| w.min.is_finite() && w.max.is_finite() && !w.is_empty());
+    let mut extents_area = !model && paper_window.is_none() && (page.plot_area.eq_ignore_ascii_case("extents") || forced_fit);
+    let framed = extents_area || paper_window.is_some();
+    let fit = o.fit.unwrap_or(model || window.is_some() || (framed && page.scale_to_fit));
+    let scale = if model { o.scale } else { o.scale.or(Some(page.scale)) };
     // Chord tolerance: about 0.05 mm on paper.
-    let est = plot_scale(&window.unwrap_or_else(|| d.extents(space)), &sheet, fit, o.scale);
+    let est = plot_scale(&window.or(paper_window).unwrap_or_else(|| d.extents(space)), &sheet, fit, scale);
     let tol = 0.05 / unit_mm / est.max(1e-300);
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
-    let b = window.unwrap_or(list.bounds);
-    let s = plot_scale(&b, &sheet, fit, o.scale);
-    let map = if fit || matches!(space, Space::Model) {
+    // What the page shows, now that what the layout draws is known: a window that lies outside
+    // it would leave the page blank, as would a sheet whose objects all lie beyond it.
+    let drawn = list.bounds;
+    let label = sheet_name(space);
+    let span = |b: &Bounds2| format!("x {:.1}..{:.1}, y {:.1}..{:.1}", b.min.x, b.max.x, b.min.y, b.max.y);
+    let mut warnings = Vec::new();
+    if let Some(w) = paper_window
+        && !drawn.is_empty()
+        && !w.intersects(&drawn)
+    {
+        if forced_fit {
+            warnings.push(format!(
+                "{label}: the page setup's window ({}) lies outside what the layout draws ({}); the extents were plotted instead",
+                span(&w),
+                span(&drawn)
+            ));
+            paper_window = None;
+            extents_area = true;
+        } else {
+            warnings.push(format!(
+                "{label}: the page setup's window ({}) lies outside what the layout draws ({}): the page is blank; `fit` (convert --fit) plots the extents",
+                span(&w),
+                span(&drawn)
+            ));
+        }
+    }
+    let framed = extents_area || paper_window.is_some();
+    let fit = o.fit.unwrap_or(model || window.is_some() || (framed && page.scale_to_fit));
+    if !model && !framed && !drawn.is_empty() && !drawn.intersects(&sheet.bounds()) {
+        warnings.push(format!(
+            "{label}: the layout's objects ({}) lie outside its sheet ({}): the page is blank; `fit` (convert --fit) plots them",
+            span(&drawn),
+            span(&sheet.bounds())
+        ));
+    }
+    let b = window.or(paper_window).unwrap_or(drawn);
+    let s = plot_scale(&b, &sheet, fit, scale);
+    let origin = sheet.origin;
+    let map = if model {
         let (from, to) = placement(space, &b, fit, &sheet, o);
-        Map { from, s, to, k }
+        Map { from, s, to, origin, k }
+    } else if framed {
+        let (from, to) = extents_placement(&b, page.center || forced_fit, &sheet);
+        Map { from, s, to, origin, k }
     } else {
-        Map { from: Vec2::ZERO, s, to: Vec2::ZERO, k }
+        Map { from: Vec2::ZERO, s, to: Vec2::ZERO, origin, k }
     };
     // Plot style ends, joins and fill patterns at the plot scale (a layout's are already drawn).
     let mut list = list;
     cadcraft_render::pen::apply(&mut list, map.s * unit_mm);
     let media = sheet.size * k;
-    let clip_pt = if fit || matches!(space, Space::Model) {
-        Bounds2::new(sheet.printable.min * k, sheet.printable.max * k)
+    let mut clip_pt = if model || framed {
+        Bounds2::new((sheet.printable.min - origin) * k, (sheet.printable.max - origin) * k)
     } else {
         Bounds2::new(Vec2::ZERO, media)
     };
+    // A window plots only what lies inside it.
+    if let Some(w) = paper_window {
+        let (a, z) = (map.pt(w.min), map.pt(w.max));
+        clip_pt = Bounds2 { min: clip_pt.min.max(a.min(z)), max: clip_pt.max.min(a.max(z)) };
+    }
     // The layers drawn on, in order of first use.
     let mut layers: Vec<u32> = Vec::new();
     if o.layers {
@@ -449,7 +542,17 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+    Ok((SheetPage { media, list, map, clip_pt, layers, links, label }, warnings))
+}
+
+/// Where a layout's paper-space extents `b` go when its page setup plots the extents: centred
+/// on the printable area, or from its lower-left corner (the plot origin). Returns the source
+/// and destination points.
+fn extents_placement(b: &Bounds2, center: bool, sheet: &Sheet) -> (Vec2, Vec2) {
+    if b.is_empty() {
+        return (Vec2::ZERO, sheet.printable.min);
+    }
+    if center { (b.center(), sheet.printable.center()) } else { (b.min, sheet.printable.min) }
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.
@@ -553,22 +656,119 @@ pub(crate) fn plot_scale(b: &Bounds2, sheet: &Sheet, fit: bool, scale: Option<f6
     if s.is_finite() && s > 0.0 { s } else { 1.0 }
 }
 
-/// A number for a content stream: short, finite, no exponent.
+/// A number for a content stream: short, finite, no exponent (three decimals, trailing zeros
+/// dropped). Written digit by digit: a plot writes millions of them, and formatting each one
+/// through `format!` took a third of a large page's time.
 fn num(out: &mut String, v: f64) {
     let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
-    let mut s = format!("{v:.3}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
+    // Thousandths, rounded half to even like `{:.3}`.
+    let scaled = v.abs() * 1000.0;
+    let floor = scaled.floor();
+    let rest = scaled - floor;
+    let rounded = if rest > 0.5 || (rest == 0.5 && floor % 2.0 == 1.0) { floor + 1.0 } else { floor };
+    let thousandths = rounded as u64;
+    if thousandths == 0 {
+        out.push('0');
+        return;
+    }
+    if v < 0.0 {
+        out.push('-');
+    }
+    let (int, frac) = (thousandths / 1000, thousandths % 1000);
+    let mut digits = [0u8; 20];
+    let mut n = digits.len();
+    let mut i = int;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + (i % 10) as u8;
+        i /= 10;
+        if i == 0 {
+            break;
         }
     }
-    if s == "-0" {
-        s = "0".into();
+    out.push_str(std::str::from_utf8(digits.get(n..).unwrap_or(b"0")).unwrap_or("0"));
+    if frac != 0 {
+        let f = [b'0' + (frac / 100) as u8, b'0' + ((frac / 10) % 10) as u8, b'0' + (frac % 10) as u8];
+        let keep = if f[2] != b'0' {
+            3
+        } else if f[1] != b'0' {
+            2
+        } else {
+            1
+        };
+        out.push('.');
+        out.push_str(std::str::from_utf8(f.get(..keep).unwrap_or(b"")).unwrap_or(""));
     }
-    out.push_str(&s);
+}
+
+#[cfg(test)]
+mod num_tests {
+    use super::num;
+
+    /// What `num` wrote before, through `format!`.
+    fn reference(v: f64) -> String {
+        let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
+        let mut s = format!("{v:.3}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        if s == "-0" {
+            s = "0".into();
+        }
+        s
+    }
+
+    #[test]
+    fn numbers_are_written_as_format_wrote_them() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            0.0005,
+            0.0625,
+            -0.0625,
+            1.0005,
+            72.0,
+            90.0,
+            0.709,
+            841.89,
+            595.276,
+            1e7,
+            -1e7,
+            2e9,
+            f64::NAN,
+            f64::INFINITY,
+            0.001,
+            0.0004,
+            0.9995,
+            999.9995,
+            123456.789,
+        ];
+        let mut x = 0.37_f64;
+        for _ in 0..20_000 {
+            x = (x * 7919.0 + 0.123).rem_euclid(20_000.0) - 10_000.0;
+            values.push(x);
+            values.push(x / 1000.0);
+        }
+        for v in values {
+            let mut s = String::new();
+            num(&mut s, v);
+            let r = reference(v);
+            if s != r {
+                // Only the multiplication's last-bit rounding may differ from an exact decimal
+                // expansion, and then by one thousandth.
+                let (a, b): (f64, f64) = (s.parse().unwrap(), r.parse().unwrap());
+                assert!((a - b).abs() <= 0.0011, "{v}: {s} vs {r}");
+            }
+        }
+    }
 }
 
 fn pt(out: &mut String, p: Vec2) {
@@ -601,6 +801,7 @@ fn content_stream(
     clip_pt: &Bounds2,
     layers: &[u32],
     texts: &std::collections::HashMap<u32, (usize, &cadcraft_render::PlotText)>,
+    images: &std::collections::HashMap<u32, (usize, &cadcraft_render::PlotImage)>,
 ) -> (String, Vec<u8>) {
     let marked: std::collections::HashSet<u32> = layers.iter().copied().collect();
     let white = Rgb(255, 255, 255);
@@ -630,7 +831,13 @@ fn content_stream(
     // The transparency (percent) marks are drawn with, and those used on the page.
     let mut alpha: u8 = 0;
     let mut alphas: Vec<u8> = Vec::new();
+    // The rest of a placeholder replaced by its image.
+    let mut skip = 0u32;
     for (i, p) in list.prims.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
         let want = list.prim_layers.get(i).copied().filter(|l| marked.contains(l));
         let text = u32::try_from(i).ok().and_then(|i| texts.get(&i));
         if text_font.is_some() && (text.is_none() || want != layer) {
@@ -661,6 +868,12 @@ fn content_stream(
                 alphas.push(t);
             }
             alpha = t;
+        }
+        if let Some((n, img)) = u32::try_from(i).ok().and_then(|i| images.get(&i)) {
+            flush(&mut c, &mut pending);
+            image(&mut c, *n, img, map);
+            skip = img.prims.saturating_sub(1);
+            continue;
         }
         let w = f64::from(p.lw) * PT_PER_MM;
         let w = if w.is_finite() && w > 0.0 { w.min(100.0) } else { 0.0 };
@@ -761,6 +974,87 @@ fn content_stream(
     (c, alphas)
 }
 
+/// Draw image XObject `/Im<n>` over the unit square mapped onto `img`, clipped to its boundary.
+fn image(c: &mut String, n: usize, img: &cadcraft_render::PlotImage, map: &Map) {
+    c.push_str("q\n");
+    for outline in [&img.viewport, &img.clip] {
+        if outline.len() >= 3 {
+            for (i, q) in outline.iter().enumerate() {
+                pt(c, map.pt(*q));
+                c.push_str(if i == 0 { " m\n" } else { " l\n" });
+            }
+            c.push_str("h W n\n");
+        }
+    }
+    let o = map.pt(img.origin);
+    let u = map.pt(img.origin + img.u) - o;
+    let v = map.pt(img.origin + img.v) - o;
+    for (i, x) in [u.x, u.y, v.x, v.y, o.x, o.y].into_iter().enumerate() {
+        if i > 0 {
+            c.push(' ');
+        }
+        num(c, x);
+    }
+    let _ = writeln!(c, " cm\n/Im{n} Do\nQ");
+}
+
+/// The image file `path` names: as written, else in `dir` (relative paths, then the bare file
+/// name, as AutoCAD falls back to the drawing's folder).
+#[cfg(not(target_arch = "wasm32"))]
+fn find_image(path: &str, dir: Option<&str>) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let own = Path::new(path);
+    if own.is_file() {
+        return Some(own.to_path_buf());
+    }
+    let dir = Path::new(dir?);
+    let rel = path.replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    [dir.join(rel), dir.join(name)].into_iter().find(|p: &PathBuf| p.is_file())
+}
+
+/// Largest image (pixels) embedded in a plot; larger ones keep the placeholder.
+const MAX_IMAGE_PIXELS: u64 = 64_000_000;
+
+/// The image XObject body for file `path` (8-bit RGB, with a soft mask object added first
+/// when the image has transparency), or `None` when it cannot be read.
+fn image_object(objs: &mut Objects, path: &str, dir: Option<&str>, compress: bool) -> Option<Vec<u8>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (objs, path, dir, compress);
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let file = find_image(path, dir)?;
+        let img = image::ImageReader::open(file).ok()?.with_guessed_format().ok()?.decode().ok()?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+            return None;
+        }
+        let rgba = img.to_rgba8();
+        let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+        let mut alpha = Vec::with_capacity(w as usize * h as usize);
+        for px in rgba.pixels() {
+            rgb.extend_from_slice(&px.0[..3]);
+            alpha.push(px.0[3]);
+        }
+        let dict = format!(" /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8");
+        let smask = if alpha.iter().any(|a| *a < 255) {
+            let m = objs.add(stream(
+                &alpha,
+                compress,
+                &format!(" /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8"),
+            ));
+            format!(" /SMask {m} 0 R")
+        } else {
+            String::new()
+        };
+        Some(stream(&rgb, compress, &format!("{dict}{smask}")))
+    }
+}
+
 /// The page resources' graphics states for transparencies `alphas` (percent): `/T<percent>`
 /// sets the stroke and fill alpha (`/CA`, `/ca`). Empty when there are none.
 fn ext_gstates(alphas: &[u8]) -> String {
@@ -846,13 +1140,26 @@ fn uri_string(url: &str) -> Option<String> {
     Some(out)
 }
 
+/// Streams larger than this compress at a faster level: a large drawing's content stream
+/// takes seconds at the default level for a few per cent of size (measured: 167 MB in 11.4 s
+/// at level 6 to 38 MB, 3.7 s at level 3 to 40 MB).
+const FAST_COMPRESSION_FROM: usize = 8 << 20;
+
 /// A stream object body, Flate-compressed when asked.
 fn stream(data: &[u8], compress: bool, extra: &str) -> Vec<u8> {
-    let (data, filter) = if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, 6), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
+    let level = if data.len() >= FAST_COMPRESSION_FROM { 3 } else { 6 };
+    let (data, filter) =
+        if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, level), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
     let mut out = format!("<< /Length {}{filter}{extra} >>\nstream\n", data.len()).into_bytes();
     out.extend_from_slice(&data);
     out.extend_from_slice(b"\nendstream");
     out
+}
+
+/// [`stream`] for the crate's tests.
+#[cfg(test)]
+pub(crate) fn stream_for_test(data: &[u8], compress: bool) -> Vec<u8> {
+    stream(data, compress, "")
 }
 
 /// PDF objects being written: bodies by object number - 1.
@@ -897,10 +1204,32 @@ fn assemble(d: &Drawing, pages: &[SheetPage], fonts: &fonts::Fonts, o: &PdfOptio
     let mut kids = Vec::new();
     // Page dictionaries are completed once the fonts are written: (page, its fonts, the rest).
     let mut page_dicts: Vec<(usize, Vec<usize>, String, String, String)> = Vec::new();
+    // Image XObjects shared by all pages, by file as the drawing names it: (name, object), or
+    // `None` when the file cannot be read.
+    let mut image_ids: std::collections::HashMap<&str, Option<(usize, usize)>> = std::collections::HashMap::new();
     for p in pages {
         let page = objs.reserve();
         let texts = fonts.texts(&p.list);
-        let (marks, alphas) = content_stream(&p.list, &p.map, &p.clip_pt, &p.layers, &texts);
+        let mut images = std::collections::HashMap::new();
+        let mut xobjects = String::new();
+        for img in &p.list.images {
+            let found = match image_ids.get(img.path.as_str()) {
+                Some(f) => *f,
+                None => {
+                    let n = image_ids.values().flatten().count();
+                    let f = image_object(&mut objs, &img.path, o.image_dir.as_deref(), true).map(|body| (n, objs.add(body)));
+                    image_ids.insert(img.path.as_str(), f);
+                    f
+                }
+            };
+            if let Some((n, id)) = found {
+                if !xobjects.contains(&format!("/Im{n} ")) {
+                    let _ = write!(xobjects, " /Im{n} {id} 0 R");
+                }
+                images.insert(img.prim, (n, img));
+            }
+        }
+        let (marks, alphas) = content_stream(&p.list, &p.map, &p.clip_pt, &p.layers, &texts, &images);
         let content = objs.add(stream(marks.as_bytes(), o.compress, ""));
         let mut used: Vec<usize> = texts.values().map(|(f, _)| *f).collect();
         used.sort_unstable();
@@ -931,7 +1260,11 @@ fn assemble(d: &Drawing, pages: &[SheetPage], fonts: &fonts::Fonts, o: &PdfOptio
         let mut mb = String::new();
         pt(&mut mb, p.media);
         let annots = if annots.is_empty() { String::new() } else { format!(" /Annots [{}]", refs(annots)) };
-        page_dicts.push((page, used, props, ext_gstates(&alphas), format!("/MediaBox [0 0 {mb}] /Contents {content} 0 R{annots}")));
+        let mut gstates = ext_gstates(&alphas);
+        if !xobjects.is_empty() {
+            let _ = write!(gstates, " /XObject <<{xobjects} >>");
+        }
+        page_dicts.push((page, used, props, gstates, format!("/MediaBox [0 0 {mb}] /Contents {content} 0 R{annots}")));
         kids.push(page);
     }
     let font_ids = if fonts.is_empty() { Vec::new() } else { fonts.write(&mut objs, o.compress) };

@@ -324,8 +324,14 @@ fn put_xdata(d: &mut Drawing, mut xdata: HashMap<Handle, Vec<RawTag>>) {
     }
 }
 
-/// Keep what `secs` holds that the reader did not model in `d.foreign`.
-pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
+/// Keep what `secs` holds that the reader did not model in `d.foreign`. Objects owned by one of
+/// the `gone` handles (records the parser stepped over, or the DWG bridge dropped), whose own
+/// handle is one (an extension dictionary of such a record), or an extension dictionary whose
+/// entries all named one (a DGN linetype's, holding its definition), go with it: they are not
+/// kept, and are returned counted by type, with the record types of what lost an extension
+/// dictionary that way (those found here, and the owners in `emptied_of`, which the DWG bridge
+/// found before writing the text).
+pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>, emptied_of: &[String]) -> (Vec<(String, usize)>, Vec<(String, usize)>) {
     let get = |name: &str| secs.iter().find(|s| s.name == name).map(|s| split(&s.tags)).unwrap_or_default();
     let (classes, tables, blocks, entities, objects) = (get("CLASSES"), get("TABLES"), get("BLOCKS"), get("ENTITIES"), get("OBJECTS"));
     // The drawing's entities by handle: whether each is of a type CADCraft doesn't model.
@@ -334,6 +340,19 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
         ents.entry(e.handle.hex()).or_insert(matches!(e.kind, EntityKind::Unknown(_)));
     }
     let ids = identities(&tables, &blocks, &objects);
+    // The record type of a handle an extension dictionary belongs to: a table record or block
+    // by its role, an entity by its record.
+    let entity_kinds: HashMap<String, String> = blocks.iter().chain(&entities).filter_map(|(k, _, t)| Some((head(t).handle?, k.clone()))).collect();
+    let kind_of_owner =
+        |h: &str| -> String { ids.get(h).map(|k| k.0.clone()).or_else(|| entity_kinds.get(h).cloned()).unwrap_or_else(|| "OBJECT".to_string()) };
+    let mut emptied: Vec<(String, usize)> = Vec::new();
+    let bump = |counts: &mut Vec<(String, usize)>, k: String| match counts.iter_mut().find(|(x, _)| *x == k) {
+        Some((_, n)) => *n = n.saturating_add(1),
+        None => counts.push((k, 1)),
+    };
+    for h in emptied_of {
+        bump(&mut emptied, kind_of_owner(h));
+    }
     // Extension dictionaries of entities and records: owner → dictionary.
     let mut xdict_of: HashMap<String, String> = HashMap::new();
     for (kind, _, t) in tables.iter().chain(&blocks).chain(&entities) {
@@ -345,11 +364,15 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
             xdict_of.entry(o).or_insert(x);
         }
     }
+    // Each object's head, read once: a dictionary of hundreds of thousands of entries owns as
+    // many objects, and reading its head again for each of them (its entries come before the
+    // end of its groups) made this quadratic.
+    let heads: Vec<Head> = objects.iter().map(|(_, _, t)| head(t)).collect();
     // Objects by handle: the first of each, and none that has an entity's handle.
     let mut by_handle: HashMap<String, usize> = HashMap::new();
-    for (i, (_, _, t)) in objects.iter().enumerate() {
-        if let Some(h) = head(t).handle.filter(|h| handle(h).is_some() && !ents.contains_key(h)) {
-            by_handle.entry(h).or_insert(i);
+    for (i, hd) in heads.iter().enumerate() {
+        if let Some(h) = hd.handle.as_ref().filter(|h| handle(h).is_some() && !ents.contains_key(*h)) {
+            by_handle.entry(h.clone()).or_insert(i);
         }
     }
     let root = objects.first().filter(|(k, _, _)| is_dictionary(k)).and_then(|(_, _, t)| head(t).handle);
@@ -357,17 +380,25 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
     let root_key = |h: &str| root_entries.iter().find(|(_, eh)| eh == h).map(|(k, _)| k.clone());
     // An extension dictionary of an entity or record (not of another object).
     let is_xdict = |k: usize| {
-        let Some((_, _, t)) = objects.get(k) else { return false };
-        let hd = head(t);
-        let (Some(h), Some(o)) = (hd.handle, hd.owner) else { return false };
-        !by_handle.contains_key(&o) && xdict_of.get(&o) == Some(&h) && (ents.contains_key(&o) || ids.contains_key(&o))
+        let Some(hd) = heads.get(k) else { return false };
+        let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { return false };
+        !by_handle.contains_key(o) && xdict_of.get(o) == Some(h) && (ents.contains_key(o) || ids.contains_key(o))
     };
-    let modelled_entry = |t: &[Tag], h: &str| entries(t).iter().any(|(k, eh)| eh == h && MODELLED_XDICT_KEYS.contains(&up(k).as_str()));
+    // The objects an extension dictionary lists under a modelled key, per dictionary, read once.
+    let mut modelled_in: HashMap<usize, HashSet<String>> = HashMap::new();
     // Which objects to keep: those under a named object dictionary entry CADCraft doesn't model,
     // under the extension dictionary of an entity or record (minus modelled entries; one left
     // empty goes), or owned by an entity of a type CADCraft doesn't model. Memoized along each
     // ownership chain; cycles and over-long chains are not kept.
-    let mut memo: HashMap<usize, bool> = HashMap::new();
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Keep,
+        Drop,
+        /// Owned, down the chain, by a record the parser stepped over.
+        Gone,
+    }
+    let keep_if = |yes: bool| if yes { Verdict::Keep } else { Verdict::Drop };
+    let mut memo: HashMap<usize, Verdict> = HashMap::new();
     for i in 0..objects.len() {
         let mut path: Vec<usize> = Vec::new();
         let mut cur = i;
@@ -376,46 +407,75 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
                 break v;
             }
             if path.contains(&cur) || path.len() >= MAX_DEPTH {
-                break false;
+                break Verdict::Drop;
             }
             path.push(cur);
-            let Some((_, _, t)) = objects.get(cur) else { break false };
-            let hd = head(t);
-            let (Some(h), Some(o)) = (hd.handle, hd.owner) else { break false };
-            if by_handle.get(&h) != Some(&cur) {
-                break false;
+            let Some(hd) = heads.get(cur) else { break Verdict::Drop };
+            let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { break Verdict::Drop };
+            if by_handle.get(h) != Some(&cur) {
+                break Verdict::Drop;
             }
-            if Some(&o) == root.as_ref() {
-                break root_key(&h).is_some_and(|k| !modelled_key(&k));
+            if gone.contains(h) {
+                break Verdict::Gone;
             }
-            if let Some(&j) = by_handle.get(&o) {
-                if is_xdict(j) && objects.get(j).is_some_and(|p| modelled_entry(p.2, &h)) {
-                    break false;
+            if Some(o) == root.as_ref() {
+                break keep_if(root_key(h).is_some_and(|k| !modelled_key(&k)));
+            }
+            if let Some(&j) = by_handle.get(o) {
+                if is_xdict(j) {
+                    let listed = modelled_in.entry(j).or_insert_with(|| {
+                        let entries = objects.get(j).map(|(_, _, p)| entries(p)).unwrap_or_default();
+                        entries.into_iter().filter(|(k, _)| MODELLED_XDICT_KEYS.contains(&up(k).as_str())).map(|(_, eh)| eh).collect()
+                    });
+                    if listed.contains(h) {
+                        break Verdict::Drop;
+                    }
                 }
                 cur = j;
                 continue;
             }
-            if is_xdict(cur) {
-                break entries(t).iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str()));
+            if gone.contains(o) {
+                break Verdict::Gone;
             }
-            break ents.get(&o) == Some(&true);
+            if is_xdict(cur) {
+                let Some((_, _, t)) = objects.get(cur) else { break Verdict::Drop };
+                let es = entries(t);
+                if !es.is_empty() && es.iter().all(|(_, eh)| gone.contains(eh)) {
+                    bump(&mut emptied, kind_of_owner(o));
+                    break Verdict::Gone;
+                }
+                break keep_if(es.iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str())));
+            }
+            break keep_if(ents.get(o) == Some(&true));
         };
         for p in path {
             memo.insert(p, verdict);
         }
     }
+    // What went with the records the parser stepped over, by type.
+    let mut with_them: Vec<(String, usize)> = Vec::new();
+    for (i, (kind, _, _)) in objects.iter().enumerate() {
+        if memo.get(&i) == Some(&Verdict::Gone) {
+            let k = up(kind);
+            match with_them.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, n)) => *n = n.saturating_add(1),
+                None => with_them.push((k, 1)),
+            }
+        }
+    }
+    with_them.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut f = Foreign::default();
     let mut kept: HashSet<String> = HashSet::new();
     for (i, (kind, _, t)) in objects.iter().enumerate() {
-        if memo.get(&i) != Some(&true) || f.objects.len() >= MAX_OBJECTS {
+        if memo.get(&i) != Some(&Verdict::Keep) || f.objects.len() >= MAX_OBJECTS {
             continue;
         }
-        let Some(h) = head(t).handle.and_then(|h| handle(&h)) else { continue };
+        let Some(h) = heads.get(i).and_then(|hd| hd.handle.as_deref()).and_then(handle) else { continue };
         let mut tags: Vec<RawTag> = t.iter().map(raw).collect();
         if is_xdict(i) {
             strip_entries(&mut tags);
         }
-        if head(t).owner == root
+        if heads.get(i).is_some_and(|hd| hd.owner == root)
             && let Some(key) = root_key(&h.hex())
         {
             f.dictionary.push((key, h));
@@ -491,6 +551,8 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
     if !f.is_empty() {
         d.foreign = Arc::new(f);
     }
+    emptied.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (with_them, emptied)
 }
 
 /// Most groups of a data store section kept (a damaged file's can be endless).

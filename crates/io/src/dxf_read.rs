@@ -1,10 +1,10 @@
 //! DXF → Drawing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::*;
-use cadcraft_dxf::{Tag, records, sections};
+use cadcraft_dxf::{Tag, record_slices};
 use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
@@ -485,7 +485,9 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             center: t.p(10),
             width: t.fd(40, 1.0),
             height: t.fd(41, 1.0),
-            view_center: Vec2::new(t.fd(12, 0.0), t.fd(22, 0.0)),
+            // 12/22 is the view centre relative to the view target (17/27/37); in plan view the
+            // model point at the centre is their sum.
+            view_center: Vec2::new(t.fd(12, 0.0) + t.fd(17, 0.0), t.fd(22, 0.0) + t.fd(27, 0.0)),
             view_height: t.fd(45, 1.0),
             id: t.i(69).unwrap_or(0) as u32,
             locked: t.i(90).unwrap_or(0) & 16384 != 0,
@@ -493,7 +495,9 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             layer_colors: crate::dxf_ext::read_layer_colors(tags),
             // Status flags: 65536 = non-rectangular clipping (by the 340 entity), 131072 = off.
             clip: t.s(340).and_then(|h| Handle::parse_hex(&h)).filter(|h| h.0 != 0 && t.i(90).unwrap_or(0) & 65536 != 0),
-            on: t.i(90).unwrap_or(0) & 131072 == 0,
+            // Off when the status flags say so, or when status 68 is 0 (the DXF Reference: 0 =
+            // off, a positive value the stacking order; some writers set only one of the two).
+            on: t.i(90).unwrap_or(0) & 131072 == 0 && t.i(68).is_none_or(|v| v != 0),
         }),
         "WIPEOUT" => {
             let o = t.p(10);
@@ -988,11 +992,18 @@ struct Rx {
 }
 
 /// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
-/// named object dictionary (the first object), by placeholder handle.
-fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
+/// named object dictionary (the first object), by placeholder handle, and in the dictionary's
+/// order (Normal left out).
+fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> (HashMap<String, String>, Vec<String>) {
+    let (names, declared) = plot_style_entries(secs);
+    (names, declared.into_iter().filter(|n| !n.eq_ignore_ascii_case(cadcraft_doc::NORMAL_STYLE)).collect())
+}
+
+fn plot_style_entries(secs: &[cadcraft_dxf::Section]) -> (HashMap<String, String>, Vec<String>) {
     let mut out = HashMap::new();
-    let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return out };
-    let recs = records(&objects.tags);
+    let mut order = Vec::new();
+    let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return (out, order) };
+    let recs = record_slices(&objects.tags);
     let entries = |tags: &[Tag]| {
         let mut v: Vec<(String, String)> = Vec::new();
         let mut name: Option<String> = None;
@@ -1009,20 +1020,24 @@ fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
         }
         v
     };
-    let Some((_, root)) = recs.iter().find(|(k, _)| k == "DICTIONARY") else { return out };
+    let Some((_, root)) = recs.iter().find(|(k, _)| k == "DICTIONARY") else { return (out, order) };
     let Some((_, dict)) = entries(root).into_iter().find(|(n, _)| n.eq_ignore_ascii_case(crate::dxf_ext::PLOT_STYLE_NAMES_KEY)) else {
-        return out;
+        return (out, order);
     };
     let is_dict = |k: &str| k == "DICTIONARY" || k == "ACDBDICTIONARYWDFLT";
     let Some((_, tags)) = recs.iter().find(|(k, tg)| is_dict(k) && T(tg).s(5).is_some_and(|h| h.trim().eq_ignore_ascii_case(&dict))) else {
-        return out;
+        return (out, order);
     };
     for (n, h) in entries(tags).into_iter().take(crate::dxf_ext::MAX_PLOT_STYLE_NAMES) {
         if !n.trim().is_empty() {
-            out.insert(h, n.chars().take(255).collect());
+            let name: String = n.chars().take(255).collect();
+            if !order.iter().any(|x: &String| x.eq_ignore_ascii_case(&name)) {
+                order.push(name.clone());
+            }
+            out.insert(h, name);
         }
     }
-    out
+    (out, order)
 }
 
 /// The named plot style an entity record points at (group 390 among its AcDbEntity groups).
@@ -1083,12 +1098,13 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
             }
             rx.mleader_fix.push((h, pending));
         }
-        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's group 341 layer handles.
+        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's layer handles: group 341 in
+        // R2000–R2002 files, 331 from R2004 on.
         ("VIEWPORT", EntityKind::Viewport(v)) if v.frozen_layers.is_empty() => {
             v.frozen_layers = tags
                 .iter()
                 .take_while(|t| t.code < 1000)
-                .filter(|t| t.code == 341)
+                .filter(|t| t.code == 331 || t.code == 341)
                 .filter_map(|t| rx.layers.get(&t.str().trim().to_ascii_uppercase()).cloned())
                 .collect();
         }
@@ -1098,7 +1114,7 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
 
 /// Parse a run of entity records (ENTITIES section or a block's body) into entities. Records that
 /// can't be placed are counted in `skipped`.
-fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx, skipped: &mut usize) -> Vec<(Option<String>, bool, Entity)> {
+fn parse_entities(recs: &[(String, &[Tag])], d: &mut Drawing, rx: &mut Rx, skipped: &mut usize) -> Vec<(Option<String>, bool, Entity)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some((kind, tags)) = recs.get(i) {
@@ -1380,7 +1396,7 @@ fn style_font(tags: &[Tag], file: String) -> String {
 }
 
 fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
-    let recs = records(tags);
+    let recs = record_slices(tags);
     // STYLE handle → name, or the shape file of an unnamed shape style (linetype elements).
     let ltype_styles: HashMap<String, String> = recs
         .iter()
@@ -1418,7 +1434,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
     }
     let mut active_vport = false;
     for (kind, tg) in recs {
-        let t = T(&tg);
+        let t = T(tg);
         match kind.as_str() {
             "LAYER" => {
                 let name = t.s(2).unwrap_or_default();
@@ -1445,11 +1461,11 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if let Some(n) = t.s(390).and_then(|h| rx.pstyles.get(&h.trim().to_ascii_uppercase())) {
                     l.plot_style = n.clone();
                 }
-                let alpha = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_TRANSPARENCY_APP).iter().find(|x| x.code == 1071);
+                let alpha = crate::dxf_ext::xdata(tg, crate::dxf_ext::LAYER_TRANSPARENCY_APP).iter().find(|x| x.code == 1071);
                 if let Some(pct) = alpha.and_then(|x| crate::dxf_ext::transparency_from_dxf(x.i64())) {
                     l.transparency = pct;
                 }
-                if let Some(desc) = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_DESCRIPTION_APP).iter().filter(|x| x.code == 1000).nth(1) {
+                if let Some(desc) = crate::dxf_ext::xdata(tg, crate::dxf_ext::LAYER_DESCRIPTION_APP).iter().filter(|x| x.code == 1000).nth(1) {
                     l.description = desc.str();
                 }
                 match d.layer_mut(&name) {
@@ -1462,7 +1478,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if name.is_empty() || d.linetype(&name).is_some() {
                     continue;
                 }
-                let pattern = ltype_pattern(&tg, &ltype_styles);
+                let pattern = ltype_pattern(tg, &ltype_styles);
                 d.linetypes.push(Linetype { name, description: t.s(3).unwrap_or_default(), pattern });
             }
             "STYLE" => {
@@ -1474,7 +1490,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 let gen_flags = t.i(71).unwrap_or(0);
                 let st = TextStyle {
                     name: name.clone(),
-                    font: style_font(&tg, t.s(3).unwrap_or_default()),
+                    font: style_font(tg, t.s(3).unwrap_or_default()),
                     big_font: t.s(4).unwrap_or_default(),
                     height: t.fd(40, 0.0),
                     width_factor: t.fd(41, 1.0),
@@ -1482,7 +1498,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     backwards: gen_flags & 2 != 0,
                     upside_down: gen_flags & 4 != 0,
                     vertical: t.i(70).unwrap_or(0) & 4 != 0,
-                    annotative: annotative(&tg),
+                    annotative: annotative(tg),
                 };
                 match d.text_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
@@ -1521,7 +1537,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if !(center.x.is_finite() && center.y.is_finite()) {
                     continue;
                 }
-                let x = crate::dxf_ext::xdata(&tg, crate::dxf_ext::APP);
+                let x = crate::dxf_ext::xdata(tg, crate::dxf_ext::APP);
                 let field = |key: &str| {
                     x.iter().position(|t| t.code == 1000 && t.str() == key).and_then(|i| x.get(i + 1)).filter(|t| t.code == 1000).map(Tag::str)
                 };
@@ -1561,8 +1577,8 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                         fields.insert(field.to_string(), v);
                     }
                 }
-                fields.extend(crate::dxf_ext::read_newer_dimvars(&tg, &rx.styles, &rx.brs, &rx.ltypes));
-                let mut st = DimStyle { name: name.clone(), annotative: annotative(&tg), ..DimStyle::default() };
+                fields.extend(crate::dxf_ext::read_newer_dimvars(tg, &rx.styles, &rx.brs, &rx.ltypes));
+                let mut st = DimStyle { name: name.clone(), annotative: annotative(tg), ..DimStyle::default() };
                 st.apply_fields(&fields);
                 match d.dim_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
@@ -1647,15 +1663,114 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 }
 
 /// Read a DXF file into a drawing.
+/// How a file is read: `keep_all` keeps every object the file has, whatever the cost (the DGN
+/// line-style objects beyond [`cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS`] included).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub keep_all: bool,
+}
+
+/// The most DGN line-style objects kept under `o`.
+pub fn dgn_cap(o: &ReadOptions) -> usize {
+    if o.keep_all { usize::MAX } else { cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS }
+}
+
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
-    let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
-    let secs = sections(&tags);
+    read_with(bytes, &ReadOptions::default())
+}
+
+/// [`read`] under [`ReadOptions`].
+pub fn read_with(bytes: &[u8], o: &ReadOptions) -> Result<Drawing> {
+    let (secs, outside, left_out) = sections_left_out(bytes, dgn_cap(o))?;
+    read_sections_left_out(secs, outside, &left_out, &mut |_| {})
+}
+
+/// What was left out before the drawing was built: DGN line-style objects beyond the cap
+/// ([`sections_left_out`] stepping over them, or the DWG bridge dropping them), by type; the
+/// upper-case hex handles of those objects and of what they hard-owned, so that an object
+/// whose owner, or own handle, is one of them goes with them; what the DWG bridge already
+/// dropped with them, by type; and the cap the file passed.
+#[derive(Clone, Debug, Default)]
+pub struct LeftOut {
+    pub dgn_line_styles: Vec<(String, usize)>,
+    pub handles: HashSet<String>,
+    pub with_them: Vec<(String, usize)>,
+    /// The owners (upper-case hex handles) of the extension dictionaries the bridge dropped
+    /// for holding only them: named by record type in the note.
+    pub emptied_of: Vec<String>,
+    pub cap: usize,
+}
+
+impl LeftOut {
+    pub fn is_empty(&self) -> bool {
+        self.dgn_line_styles.is_empty()
+    }
+}
+
+/// The sections of a DXF file's groups (built as the groups are read: a large file's groups are
+/// held once) and the count of groups outside any section: [`sections_left_out`] under the
+/// default cap, without the account of what it left out.
+pub fn sections_of(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
+    sections_left_out(bytes, cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS).map(|(secs, outside, _)| (secs, outside))
+}
+
+/// [`sections_of`] stepping over the DGN line-style objects of a file that has more than `max`
+/// of them (no group is made for them; `usize::MAX` keeps them all) and saying so. A file with
+/// fewer keeps them like any other object it has (it is read again, keeping them, when the first
+/// pass finds some).
+pub fn sections_left_out(bytes: &[u8], max: usize) -> Result<(Vec<cadcraft_dxf::Section>, usize, LeftOut)> {
+    let parse = |skip: &dyn Fn(&str) -> bool| cadcraft_dxf::parse_sections(bytes, skip).map_err(|e| IoError::Format(e.to_string()));
+    let p = if max == usize::MAX { parse(&|_| false)? } else { parse(&cadcraft_dwg::is_dgn_line_style)? };
+    let n: usize = p.skipped.iter().map(|(_, c)| c).sum();
+    if n == 0 {
+        return Ok((p.sections, p.outside, LeftOut::default()));
+    }
+    if n <= max {
+        let p = parse(&|_| false)?;
+        return Ok((p.sections, p.outside, LeftOut::default()));
+    }
+    let handles = p.skipped_handles.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    Ok((p.sections, p.outside, LeftOut { dgn_line_styles: p.skipped, handles, with_them: Vec::new(), emptied_of: Vec::new(), cap: max }))
+}
+
+/// What the DWG bridge left out of a file's DXF text ([`cadcraft_dwg::DwgProbe::dgn_line_styles`]),
+/// as the account the reader of that text takes; `None` when it left nothing out.
+pub fn left_out_from_dwg(probe: &cadcraft_dwg::DwgProbe, max: usize) -> Option<LeftOut> {
+    let l = probe.dgn_line_styles.as_ref()?;
+    let handles = l.handles.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    let emptied_of = l.emptied_of.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    Some(LeftOut { dgn_line_styles: l.objects.clone(), handles, with_them: l.with_them.clone(), emptied_of, cap: max })
+}
+
+/// [`read`] from a file's sections ([`sections_of`]).
+pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
+    read_sections_left_out(secs, outside, &LeftOut::default(), &mut |_| {})
+}
+
+/// [`read_sections`] telling `trace` the name of each phase as it starts, and `done` at the
+/// end, for `cadcraft-cli perf FILE --open` to time them.
+pub fn read_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
+    read_sections_left_out(secs, outside, &LeftOut::default(), trace)
+}
+
+/// [`read_sections_traced`] from sections [`sections_left_out`] parsed, with the account of what
+/// it stepped over: the drawing gets a note ([`Drawing::read_notes`]) on those objects, the
+/// objects they owned and the CLASS records of their types.
+pub fn read_sections_left_out(
+    secs: Vec<cadcraft_dxf::Section>,
+    outside: usize,
+    left_out: &LeftOut,
+    trace: &mut dyn FnMut(&'static str),
+) -> Result<Drawing> {
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
+    trace("plot style names");
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
-    let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
+    let (pstyles, declared_plot_styles) = plot_style_names(&secs);
+    let mut rx = Rx { pstyles, ..Rx::default() };
+    d.plot_style_names = declared_plot_styles;
     let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
@@ -1665,6 +1780,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     // a polyface mesh) would otherwise get handles that records further on still have. A file
     // CADCraft wrote names its own next handle, above which its rebuilt records are numbered
     // (#495), so it is left to that.
+    trace("handles");
     let ours = secs.iter().any(|s| s.name == "OBJECTS" && s.tags.iter().any(|t| t.code == 3 && t.str() == crate::dxf_ext::HANDSEED_KEY));
     for t in secs.iter().filter(|_| !ours).flat_map(|s| s.tags.iter()).filter(|t| t.code == 5 || t.code == 105) {
         if let Some(h) = Handle::parse_hex(t.str().trim()) {
@@ -1672,13 +1788,20 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         }
     }
     let mut skipped = std::collections::BTreeMap::new();
-    count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
+    count_skipped(&mut skipped, "(no section)", outside);
     for s in &secs {
         match s.name.as_str() {
-            "HEADER" => header(&s.tags, &mut d),
-            "TABLES" => tables(&s.tags, &mut d, &mut rx),
+            "HEADER" => {
+                trace("header");
+                header(&s.tags, &mut d);
+            }
+            "TABLES" => {
+                trace("tables");
+                tables(&s.tags, &mut d, &mut rx);
+            }
             "BLOCKS" => {
-                let recs = records(&s.tags);
+                trace("blocks");
+                let recs = record_slices(&s.tags);
                 for (k, tg) in &recs {
                     let t = T(tg);
                     if k == "BLOCK" && t.i(70).unwrap_or(0) & 4 != 0 {
@@ -1715,13 +1838,15 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             }
             // A damaged file may split its entities over several ENTITIES sections (#865).
             "ENTITIES" => {
+                trace("entities");
                 let mut n = 0;
-                entities.extend(parse_entities(&records(&s.tags), &mut d, &mut rx, &mut n));
+                entities.extend(parse_entities(&record_slices(&s.tags), &mut d, &mut rx, &mut n));
                 count_skipped(&mut skipped, "ENTITIES", n);
             }
             "OBJECTS" => {
-                for (k, tg) in records(&s.tags) {
-                    objs.add(&k, &tg);
+                trace("objects");
+                for (k, tg) in record_slices(&s.tags) {
+                    objs.add(&k, tg);
                     if k == "LAYOUT" {
                         // Fields after the AcDbLayout marker (AcDbPlotSettings also has a code 1).
                         let start = tg.iter().position(|x| x.code == 100 && x.str() == "AcDbLayout").unwrap_or(0);
@@ -1730,13 +1855,20 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         // LAYOUT has two 330s: owner dict and the block record; take the last.
                         let br = tg.iter().rfind(|x| x.code == 330).map(Tag::str).unwrap_or_default();
                         let plot = T(tg.get(..start).unwrap_or(&[]));
-                        layout_objs.push((t.s(1).unwrap_or_default(), t.i(71).unwrap_or(0) as u32, br.to_ascii_uppercase(), page_setup(&plot)));
+                        let drawing_unit_mm = if d.header.i64("MEASUREMENT", 0) == 1 { 1.0 } else { 25.4 };
+                        layout_objs.push((
+                            t.s(1).unwrap_or_default(),
+                            t.i(71).unwrap_or(0) as u32,
+                            br.to_ascii_uppercase(),
+                            page_setup(&plot, drawing_unit_mm),
+                        ));
                     }
                 }
             }
             _ => {}
         }
     }
+    trace("layouts and blocks");
     // A file CADCraft wrote names its own next handle (#495): its table records and objects
     // are numbered above it and rebuilt on save, so following $HANDSEED would drift every save.
     let own_seed = objs.xrecord_text(crate::dxf_ext::HANDSEED_KEY).and_then(|t| Handle::parse_hex(t.trim()));
@@ -1757,12 +1889,20 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         paper_block_for.insert("*PAPER_SPACE".into(), "Layout1".into());
     }
     let first_layout = d.layouts.first().map(|l| l.name.clone()).unwrap_or_else(|| "Layout1".into());
+    // Layers the entities name, made once each: a drawing with bound xrefs has thousands of
+    // layers, and `Drawing::ensure_layer` scans the table for every entity.
+    let mut known: std::collections::HashSet<String> = d.layers.iter().map(|l| l.name.to_ascii_uppercase()).collect();
+    let mut ensure = |d: &mut Drawing, name: &str| {
+        if known.insert(name.to_ascii_uppercase()) {
+            d.layers.push(Layer::new(name));
+        }
+    };
     // Blocks: model/paper space blocks hold entities in newer files.
     for (name, base, description, ents, xref) in blocks {
         let up = name.to_ascii_uppercase();
         if up == "*MODEL_SPACE" {
             for (_, _, e) in ents {
-                d.ensure_layer(&e.common.layer);
+                ensure(&mut d, &e.common.layer);
                 d.model.push(e);
             }
             continue;
@@ -1803,9 +1943,10 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         }
         d.blocks.insert(name, std::sync::Arc::new(b));
     }
+    trace("entities placed");
     // ENTITIES section: model space, or paper space when flagged (67=1).
     for (owner, paper, e) in entities {
-        d.ensure_layer(&e.common.layer);
+        ensure(&mut d, &e.common.layer);
         let owner_name = owner.and_then(|o| rx.brs.get(&o.trim().to_ascii_uppercase()).cloned()).map(|n| n.to_ascii_uppercase());
         let to_paper = paper || owner_name.as_deref().is_some_and(|n| n.starts_with("*PAPER_SPACE"));
         if to_paper {
@@ -1817,9 +1958,13 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             d.model.push(e);
         }
     }
+    trace("draw order");
     apply_sortents(&mut d, &objs.sortents, &rx.brs, &paper_block_for, &first_layout);
+    trace("objects applied");
     objs.apply(&mut d, &rx);
+    trace("images");
     crate::dxf_image::resolve(&secs, &mut d);
+    trace("multilines");
     crate::dxf_mline::resolve(&secs, &mut d);
     // Keep handles unique against the header's seed.
     let seed = d.header.str("HANDSEED", "");
@@ -1829,8 +1974,35 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     if d.layer("0").is_none() {
         d.layers.insert(0, Layer::default());
     }
-    crate::dxf_raw::read(&secs, &mut d);
+    trace("foreign data");
+    let (gone, emptied) = crate::dxf_raw::read(&secs, &mut d, &left_out.handles, &left_out.emptied_of);
+    if !left_out.is_empty() {
+        let classes = secs
+            .iter()
+            .filter(|s| s.name == "CLASSES")
+            .flat_map(|s| record_slices(&s.tags))
+            .filter(|(k, tg)| k == "CLASS" && T(tg).s(1).is_some_and(|n| cadcraft_dwg::is_dgn_line_style(&n)))
+            .count();
+        // What the DWG bridge dropped with them, and what the text still showed as theirs.
+        let mut owned = left_out.with_them.clone();
+        for (k, n) in gone {
+            match owned.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, m)) => *m = m.saturating_add(n),
+                None => owned.push((k, n)),
+            }
+        }
+        owned.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let left = cadcraft_dwg::DgnLineStylesLeftOut {
+            objects: left_out.dgn_line_styles.clone(),
+            with_them: owned,
+            handles: HashSet::new(),
+            emptied_of: Vec::new(),
+            emptied,
+        };
+        d.read_notes.push(left.note(classes, left_out.cap));
+    }
     d.skipped_records = skipped;
+    trace("done");
     Ok(d)
 }
 
@@ -1843,21 +2015,6 @@ fn count_skipped(skipped: &mut std::collections::BTreeMap<String, usize>, sectio
 
 /// Records between sections, which [`sections`] passes over: everything after an ENDSEC up to the
 /// next SECTION. Stray ENDSECs and the EOF hold nothing and don't count.
-fn outside_sections(tags: &[Tag]) -> usize {
-    let mut inside = false;
-    let mut n = 0usize;
-    for t in tags.iter().filter(|t| t.code == 0) {
-        match t.str().as_str() {
-            "SECTION" => inside = true,
-            "ENDSEC" => inside = false,
-            "EOF" => {}
-            _ if !inside => n = n.saturating_add(1),
-            _ => {}
-        }
-    }
-    n
-}
-
 /// A SORTENTSTABLE (DXF Reference, OBJECTS section): after its AcDbSortentsTable marker, the
 /// owning block record (330), then pairs of an entity handle (331) and the sort handle (5) it is
 /// drawn by.
@@ -2181,8 +2338,27 @@ fn infer_snap(d: &Drawing, osnap: i64, main: Handle, other: Option<Handle>, at: 
 }
 
 /// Page setup from a LAYOUT object's AcDbPlotSettings fields (sizes and margins in mm).
-fn page_setup(t: &T) -> PageSetup {
+/// `drawing_unit_mm` is the drawing's paper unit ($MEASUREMENT), which the plot paper units
+/// (72) override when they differ.
+fn page_setup(t: &T, drawing_unit_mm: f64) -> PageSetup {
     let mut p = PageSetup::default();
+    // Plot paper units: 0 inches, 1 millimetres (2, pixels, is left to the drawing's units).
+    let unit = match t.i(72) {
+        Some(0) => 25.4,
+        Some(1) => 1.0,
+        _ => drawing_unit_mm,
+    };
+    if (unit - drawing_unit_mm).abs() > 1e-9 {
+        p.paper_unit_mm = unit;
+    }
+    // The plot window (48/49 lower-left, 140/141 upper-right), in paper-space units.
+    let win = |c: i32| t.f(c).filter(|v| v.is_finite() && v.abs() <= 1e12);
+    if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (win(48), win(49), win(140), win(141)) {
+        let w = cadcraft_geom::Bounds2::new(Vec2::new(x0.min(x1), y0.min(y1)), Vec2::new(x0.max(x1), y0.max(y1)));
+        if w.width() > 0.0 && w.height() > 0.0 {
+            p.window = Some(w);
+        }
+    }
     let mm = |code: i32, d: f64| {
         let v = t.fd(code, d);
         if v.is_finite() && (0.0..=100_000.0).contains(&v) { v } else { d }

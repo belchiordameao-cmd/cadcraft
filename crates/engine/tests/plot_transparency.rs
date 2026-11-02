@@ -7,8 +7,8 @@ use cadcraft_engine::cmd::file::{IoHooks, base64_decode, set_io};
 use serde_json::{Value, json};
 
 /// A plotter that echoes the `plotTransparency` it was given (`none` when it got none).
-fn fake_plot(_: &cadcraft_doc::Drawing, _: &cadcraft_doc::Space, opts: &Value) -> Result<Vec<u8>, String> {
-    Ok(opts.get("plotTransparency").map_or("none".to_string(), Value::to_string).into_bytes())
+fn fake_plot(_: &cadcraft_doc::Drawing, _: &cadcraft_doc::Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>), String> {
+    Ok((opts.get("plotTransparency").map_or("none".to_string(), Value::to_string).into_bytes(), Vec::new()))
 }
 
 fn session() -> Session {

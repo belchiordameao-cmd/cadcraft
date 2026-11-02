@@ -678,8 +678,8 @@ mod tests {
 
     use crate::{CadApp, Services};
 
-    fn fake_plot(_: &cadcraft_doc::Drawing, _: &cadcraft_doc::Space, _: &Value) -> Result<Vec<u8>, String> {
-        Ok(b"%PDF-1.4 test".to_vec())
+    fn fake_plot(_: &cadcraft_doc::Drawing, _: &cadcraft_doc::Space, _: &Value) -> Result<(Vec<u8>, Vec<String>), String> {
+        Ok((b"%PDF-1.4 test".to_vec(), Vec::new()))
     }
 
     /// An app whose save dialog records the suggested name and answers `answer`.
