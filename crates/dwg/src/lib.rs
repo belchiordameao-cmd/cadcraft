@@ -31,11 +31,17 @@ pub struct Limits {
     pub max_dwg_bytes: usize,
     /// Largest DXF rendition of a DWG (checked while it is written).
     pub max_dxf_bytes: usize,
+    /// Most DGN line-style objects kept ([`MAX_DGN_LINE_STYLE_OBJECTS`]); `usize::MAX` keeps
+    /// them all, whatever the cost.
+    pub max_dgn_line_style_objects: usize,
 }
 
 impl Limits {
-    /// 512 MB of DWG, 1 GB of DXF (more than the DXF reader's group-code limit fills).
-    pub const DEFAULT: Limits = Limits { max_dwg_bytes: 512 << 20, max_dxf_bytes: 1 << 30 };
+    /// 512 MB of DWG, 1 GB of DXF (more than the DXF reader's group-code limit fills) and
+    /// [`MAX_DGN_LINE_STYLE_OBJECTS`].
+    pub const DEFAULT: Limits = Limits { max_dwg_bytes: 512 << 20, max_dxf_bytes: 1 << 30, max_dgn_line_style_objects: MAX_DGN_LINE_STYLE_OBJECTS };
+    /// [`Limits::DEFAULT`] keeping every DGN line-style object.
+    pub const KEEPING_ALL: Limits = Limits { max_dgn_line_style_objects: usize::MAX, ..Limits::DEFAULT };
 }
 
 /// What a DWG read and its DXF rendition cost, and what the reader found
@@ -57,8 +63,10 @@ pub struct DwgProbe {
     pub recovered_errors: usize,
     pub diagnostics: usize,
     /// DGN line-style objects left out before the DXF text was written, by type (none when
-    /// the file has at most [`MAX_DGN_LINE_STYLE_OBJECTS`]).
+    /// the file has at most [`Limits::max_dgn_line_style_objects`]).
     pub dgn_line_styles_left_out: Vec<(String, usize)>,
+    /// The objects they owned, left out with them, by type.
+    pub left_out_with_them: Vec<(String, usize)>,
 }
 
 /// A byte count in megabytes for messages ("9.9 MB", "1024 MB").
@@ -78,16 +86,40 @@ pub fn is_dgn_line_style(kind: &str) -> bool {
     )
 }
 
-/// The note on the DGN line-style objects a file had more than [`MAX_DGN_LINE_STYLE_OBJECTS`]
-/// of, `counts` being how many of each type were left out.
-pub fn dgn_line_style_note(counts: &[(String, usize)]) -> String {
-    let n: usize = counts.iter().map(|(_, c)| c).sum();
-    let types: Vec<String> = counts.iter().map(|(k, c)| format!("{c} {k}")).collect();
-    format!(
-        "{n} DGN line-style objects were left out ({}): a drawing keeps at most {MAX_DGN_LINE_STYLE_OBJECTS}. \
-         The drawing opens and plots without them; a file saved from it has no DGN line styles (their linetypes stay).",
-        types.join(", ")
-    )
+/// What a file with more DGN line-style objects than kept loses: the objects by type, the
+/// objects they owned (an extension dictionary of a definition, say) by type, and the CLASS
+/// records of their types, which go with them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DgnLineStylesLeftOut {
+    pub objects: Vec<(String, usize)>,
+    pub owned: Vec<(String, usize)>,
+    pub classes: usize,
+}
+
+impl DgnLineStylesLeftOut {
+    /// The note for the drawing's reader, `max` being the cap the file passed.
+    pub fn note(&self, max: usize) -> String {
+        let n: usize = self.objects.iter().map(|(_, c)| c).sum();
+        let list = |v: &[(String, usize)]| v.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(", ");
+        let mut s = format!("{n} DGN line-style objects were left out ({})", list(&self.objects));
+        let m: usize = self.owned.iter().map(|(_, c)| c).sum();
+        if m > 0 {
+            s += &format!(", with {m} {} they owned ({})", if m == 1 { "object" } else { "objects" }, list(&self.owned));
+        }
+        if self.classes > 0 {
+            s += &format!(
+                "{} the {} CLASS {} of their types",
+                if m > 0 { " and" } else { ", with" },
+                self.classes,
+                if self.classes == 1 { "record" } else { "records" }
+            );
+        }
+        s += &format!(
+            ": a drawing keeps at most {max} unless opened keeping every object. \
+             The drawing opens and plots without them; a file saved from it has no DGN line styles (their linetypes stay)."
+        );
+        s
+    }
 }
 
 fn mb(n: u64) -> String {
@@ -100,7 +132,7 @@ mod native {
     use std::io::{Cursor, Write};
     use std::panic::AssertUnwindSafe;
 
-    use super::{DwgProbe, Limits, MAX_DGN_LINE_STYLE_OBJECTS, dgn_line_style_note, is_dgn_line_style, mb};
+    use super::{DgnLineStylesLeftOut, DwgProbe, Limits, is_dgn_line_style, mb};
 
     /// Read DWG bytes and return an ASCII DXF rendition, within [`Limits::DEFAULT`].
     pub fn dwg_to_dxf(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -157,11 +189,11 @@ mod native {
         let mut doc = outcome.document;
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
-        let left_out = drop_dgn_line_styles(&mut doc);
-        if !left_out.is_empty() {
-            notes.push(dgn_line_style_note(&left_out));
+        if let Some(left) = drop_dgn_line_styles(&mut doc, limits.max_dgn_line_style_objects) {
+            notes.push(left.note(limits.max_dgn_line_style_objects));
+            probe.dgn_line_styles_left_out = left.objects;
+            probe.left_out_with_them = left.owned;
         }
-        probe.dgn_line_styles_left_out = left_out;
         let t = Instant::now();
         let mut out = CappedWriter { buf: Vec::new(), limit: limits.max_dxf_bytes, exceeded: false };
         let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
@@ -345,14 +377,16 @@ mod native {
         }
     }
 
-    /// Leave the DGN line-style objects out of the DXF text when the file has more than
-    /// [`MAX_DGN_LINE_STYLE_OBJECTS`] (see there): a DGN import leaves hundreds of thousands,
-    /// each a tree of a hundred groups that nothing draws, and converting and reading them
-    /// took most of the time and memory of opening such a file. Returns the counts by type of
-    /// what was left out (nothing when they are kept). acadrust's dictionary writer leaves out
-    /// the entries of objects that are gone, so the dictionary that listed them is written
-    /// without them.
-    fn drop_dgn_line_styles(doc: &mut acadrust::CadDocument) -> Vec<(String, usize)> {
+    /// Leave the DGN line-style objects out of the DXF text when the file has more than `max`
+    /// of them (see [`MAX_DGN_LINE_STYLE_OBJECTS`]): a DGN import leaves hundreds of thousands,
+    /// each a tree of a hundred groups that nothing draws, and converting and reading them took
+    /// most of the time and memory of opening such a file. The objects they owned (an extension
+    /// dictionary of a definition, and what it owns in turn) go with them; acadrust's dictionary
+    /// writer leaves out the entries of objects that are gone, so the dictionary that listed
+    /// them is written without them; the CLASS records of their types stay in the text and are
+    /// counted, as the reader keeps a class only for objects it has. Returns what was left out,
+    /// or `None` when they are kept.
+    fn drop_dgn_line_styles(doc: &mut acadrust::CadDocument, max: usize) -> Option<DgnLineStylesLeftOut> {
         use acadrust::objects::ObjectType;
         let name_of = |o: &ObjectType| -> Option<String> {
             match o {
@@ -361,21 +395,72 @@ mod native {
                 _ => None,
             }
         };
-        let mut counts: Vec<(String, usize)> = Vec::new();
+        let bump = |counts: &mut Vec<(String, usize)>, name: String| match counts.iter_mut().find(|(k, _)| *k == name) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => counts.push((name, 1)),
+        };
+        let mut objects: Vec<(String, usize)> = Vec::new();
         for name in doc.objects.values().filter_map(name_of) {
-            match counts.iter_mut().find(|(k, _)| *k == name) {
-                Some((_, n)) => *n = n.saturating_add(1),
-                None => counts.push((name, 1)),
+            bump(&mut objects, name);
+        }
+        if objects.iter().map(|(_, n)| n).sum::<usize>() <= max {
+            return None;
+        }
+        // What they owned, following ownership down (bounded, as a damaged file can loop).
+        let mut gone: std::collections::HashSet<acadrust::Handle> =
+            doc.objects.iter().filter(|(_, o)| name_of(o).is_some()).map(|(h, _)| *h).collect();
+        let mut owned: Vec<(String, usize)> = Vec::new();
+        for _ in 0..64 {
+            let more: Vec<(acadrust::Handle, String)> = doc
+                .objects
+                .iter()
+                .filter(|(h, _)| !gone.contains(h))
+                .filter_map(|(h, o)| owner_of(o).filter(|ow| gone.contains(ow)).map(|_| (*h, type_name_of(o))))
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for (h, name) in more {
+                gone.insert(h);
+                bump(&mut owned, name);
             }
         }
-        if counts.iter().map(|(_, n)| n).sum::<usize>() <= MAX_DGN_LINE_STYLE_OBJECTS {
-            return Vec::new();
-        }
-        doc.objects.retain(|_, o| name_of(o).is_none());
+        doc.objects.retain(|h, _| !gone.contains(h));
         doc.dgn_ls_definitions.clear();
         doc.dgn_ls_components.clear();
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        counts
+        let classes = doc.classes.iter().filter(|c| is_dgn_line_style(&c.dxf_name)).count();
+        let by_count = |a: &(String, usize), b: &(String, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+        objects.sort_by(by_count);
+        owned.sort_by(by_count);
+        Some(DgnLineStylesLeftOut { objects, owned, classes })
+    }
+
+    /// An object's owner, for the kinds of object another object owns.
+    fn owner_of(o: &acadrust::objects::ObjectType) -> Option<acadrust::Handle> {
+        use acadrust::objects::ObjectType as T;
+        match o {
+            T::Dictionary(d) => Some(d.owner),
+            T::DictionaryWithDefault(d) => Some(d.owner),
+            T::XRecord(x) => Some(x.owner),
+            T::DictionaryVariable(v) => Some(v.owner_handle),
+            T::DgnLineStyle(d) => Some(d.owner),
+            T::Unknown { owner, .. } => Some(*owner),
+            _ => None,
+        }
+    }
+
+    /// The DXF type of an object [`owner_of`] knows, for the counts.
+    fn type_name_of(o: &acadrust::objects::ObjectType) -> String {
+        use acadrust::objects::ObjectType as T;
+        match o {
+            T::Dictionary(_) => "DICTIONARY".to_string(),
+            T::DictionaryWithDefault(_) => "ACDBDICTIONARYWDFLT".to_string(),
+            T::XRecord(_) => "XRECORD".to_string(),
+            T::DictionaryVariable(_) => "DICTIONARYVAR".to_string(),
+            T::DgnLineStyle(d) => d.dxf_name().to_string(),
+            T::Unknown { type_name, .. } => type_name.trim().to_ascii_uppercase(),
+            _ => "OBJECT".to_string(),
+        }
     }
 
     /// Leave out what acadrust can't write as this DWG version: other programs' custom entities

@@ -324,8 +324,10 @@ fn put_xdata(d: &mut Drawing, mut xdata: HashMap<Handle, Vec<RawTag>>) {
     }
 }
 
-/// Keep what `secs` holds that the reader did not model in `d.foreign`.
-pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
+/// Keep what `secs` holds that the reader did not model in `d.foreign`. Objects owned by one of
+/// the `gone` handles (records the parser stepped over) go with it: they are not kept, and are
+/// returned counted by type.
+pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) -> Vec<(String, usize)> {
     let get = |name: &str| secs.iter().find(|s| s.name == name).map(|s| split(&s.tags)).unwrap_or_default();
     let (classes, tables, blocks, entities, objects) = (get("CLASSES"), get("TABLES"), get("BLOCKS"), get("ENTITIES"), get("OBJECTS"));
     // The drawing's entities by handle: whether each is of a type CADCraft doesn't model.
@@ -371,7 +373,15 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
     // under the extension dictionary of an entity or record (minus modelled entries; one left
     // empty goes), or owned by an entity of a type CADCraft doesn't model. Memoized along each
     // ownership chain; cycles and over-long chains are not kept.
-    let mut memo: HashMap<usize, bool> = HashMap::new();
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Keep,
+        Drop,
+        /// Owned, down the chain, by a record the parser stepped over.
+        Gone,
+    }
+    let keep_if = |yes: bool| if yes { Verdict::Keep } else { Verdict::Drop };
+    let mut memo: HashMap<usize, Verdict> = HashMap::new();
     for i in 0..objects.len() {
         let mut path: Vec<usize> = Vec::new();
         let mut cur = i;
@@ -380,16 +390,16 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
                 break v;
             }
             if path.contains(&cur) || path.len() >= MAX_DEPTH {
-                break false;
+                break Verdict::Drop;
             }
             path.push(cur);
-            let Some(hd) = heads.get(cur) else { break false };
-            let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { break false };
+            let Some(hd) = heads.get(cur) else { break Verdict::Drop };
+            let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { break Verdict::Drop };
             if by_handle.get(h) != Some(&cur) {
-                break false;
+                break Verdict::Drop;
             }
             if Some(o) == root.as_ref() {
-                break root_key(h).is_some_and(|k| !modelled_key(&k));
+                break keep_if(root_key(h).is_some_and(|k| !modelled_key(&k)));
             }
             if let Some(&j) = by_handle.get(o) {
                 if is_xdict(j) {
@@ -398,26 +408,41 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
                         entries.into_iter().filter(|(k, _)| MODELLED_XDICT_KEYS.contains(&up(k).as_str())).map(|(_, eh)| eh).collect()
                     });
                     if listed.contains(h) {
-                        break false;
+                        break Verdict::Drop;
                     }
                 }
                 cur = j;
                 continue;
             }
-            if is_xdict(cur) {
-                let Some((_, _, t)) = objects.get(cur) else { break false };
-                break entries(t).iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str()));
+            if gone.contains(o) {
+                break Verdict::Gone;
             }
-            break ents.get(o) == Some(&true);
+            if is_xdict(cur) {
+                let Some((_, _, t)) = objects.get(cur) else { break Verdict::Drop };
+                break keep_if(entries(t).iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str())));
+            }
+            break keep_if(ents.get(o) == Some(&true));
         };
         for p in path {
             memo.insert(p, verdict);
         }
     }
+    // What went with the records the parser stepped over, by type.
+    let mut with_them: Vec<(String, usize)> = Vec::new();
+    for (i, (kind, _, _)) in objects.iter().enumerate() {
+        if memo.get(&i) == Some(&Verdict::Gone) {
+            let k = up(kind);
+            match with_them.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, n)) => *n = n.saturating_add(1),
+                None => with_them.push((k, 1)),
+            }
+        }
+    }
+    with_them.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut f = Foreign::default();
     let mut kept: HashSet<String> = HashSet::new();
     for (i, (kind, _, t)) in objects.iter().enumerate() {
-        if memo.get(&i) != Some(&true) || f.objects.len() >= MAX_OBJECTS {
+        if memo.get(&i) != Some(&Verdict::Keep) || f.objects.len() >= MAX_OBJECTS {
             continue;
         }
         let Some(h) = heads.get(i).and_then(|hd| hd.handle.as_deref()).and_then(handle) else { continue };
@@ -501,6 +526,7 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
     if !f.is_empty() {
         d.foreign = Arc::new(f);
     }
+    with_them
 }
 
 /// Most groups of a data store section kept (a damaged file's can be endless).

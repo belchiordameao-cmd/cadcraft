@@ -1,6 +1,6 @@
 //! DXF → Drawing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::*;
@@ -1663,46 +1663,89 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 }
 
 /// Read a DXF file into a drawing.
+/// How a file is read: `keep_all` keeps every object the file has, whatever the cost (the DGN
+/// line-style objects beyond [`cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS`] included).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub keep_all: bool,
+}
+
+/// The most DGN line-style objects kept under `o`.
+pub fn dgn_cap(o: &ReadOptions) -> usize {
+    if o.keep_all { usize::MAX } else { cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS }
+}
+
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
-    let (secs, outside, notes) = sections_noted(bytes)?;
-    let mut d = read_sections(secs, outside)?;
-    d.read_notes.extend(notes);
-    Ok(d)
+    read_with(bytes, &ReadOptions::default())
+}
+
+/// [`read`] under [`ReadOptions`].
+pub fn read_with(bytes: &[u8], o: &ReadOptions) -> Result<Drawing> {
+    let (secs, outside, left_out) = sections_left_out(bytes, dgn_cap(o))?;
+    read_sections_left_out(secs, outside, &left_out, &mut |_| {})
+}
+
+/// What [`sections_left_out`] stepped over: DGN line-style objects beyond the cap, by type,
+/// their handles (the objects they owned go with them), and the cap the file passed.
+#[derive(Clone, Debug, Default)]
+pub struct LeftOut {
+    pub dgn_line_styles: Vec<(String, usize)>,
+    pub handles: HashSet<String>,
+    pub cap: usize,
+}
+
+impl LeftOut {
+    pub fn is_empty(&self) -> bool {
+        self.dgn_line_styles.is_empty()
+    }
 }
 
 /// The sections of a DXF file's groups (built as the groups are read: a large file's groups are
-/// held once) and the count of groups outside any section. [`sections_noted`] without its notes.
+/// held once) and the count of groups outside any section: [`sections_left_out`] under the
+/// default cap, without the account of what it left out.
 pub fn sections_of(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
-    sections_noted(bytes).map(|(secs, outside, _)| (secs, outside))
+    sections_left_out(bytes, cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS).map(|(secs, outside, _)| (secs, outside))
 }
 
-/// [`sections_of`] with the notes on what was left out: the DGN line-style objects of a file
-/// that has more than [`cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS`] (see there), which are
-/// stepped over as the text is parsed, so that no group is made for them. A file with fewer keeps
-/// them like any other object it has (they are read again, kept, when the first pass finds some).
-pub fn sections_noted(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize, Vec<String>)> {
+/// [`sections_of`] stepping over the DGN line-style objects of a file that has more than `max`
+/// of them (no group is made for them; `usize::MAX` keeps them all) and saying so. A file with
+/// fewer keeps them like any other object it has (it is read again, keeping them, when the first
+/// pass finds some).
+pub fn sections_left_out(bytes: &[u8], max: usize) -> Result<(Vec<cadcraft_dxf::Section>, usize, LeftOut)> {
     let parse = |skip: &dyn Fn(&str) -> bool| cadcraft_dxf::parse_sections(bytes, skip).map_err(|e| IoError::Format(e.to_string()));
-    let p = parse(&cadcraft_dwg::is_dgn_line_style)?;
+    let p = if max == usize::MAX { parse(&|_| false)? } else { parse(&cadcraft_dwg::is_dgn_line_style)? };
     let n: usize = p.skipped.iter().map(|(_, c)| c).sum();
     if n == 0 {
-        return Ok((p.sections, p.outside, Vec::new()));
+        return Ok((p.sections, p.outside, LeftOut::default()));
     }
-    if n <= cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS {
+    if n <= max {
         let p = parse(&|_| false)?;
-        return Ok((p.sections, p.outside, Vec::new()));
+        return Ok((p.sections, p.outside, LeftOut::default()));
     }
-    let note = cadcraft_dwg::dgn_line_style_note(&p.skipped);
-    Ok((p.sections, p.outside, vec![note]))
+    let handles = p.skipped_handles.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    Ok((p.sections, p.outside, LeftOut { dgn_line_styles: p.skipped, handles, cap: max }))
 }
 
 /// [`read`] from a file's sections ([`sections_of`]).
 pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
-    read_sections_traced(secs, outside, &mut |_| {})
+    read_sections_left_out(secs, outside, &LeftOut::default(), &mut |_| {})
 }
 
 /// [`read_sections`] telling `trace` the name of each phase as it starts, and `done` at the
 /// end, for `cadcraft-cli perf FILE --open` to time them.
 pub fn read_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
+    read_sections_left_out(secs, outside, &LeftOut::default(), trace)
+}
+
+/// [`read_sections_traced`] from sections [`sections_left_out`] parsed, with the account of what
+/// it stepped over: the drawing gets a note ([`Drawing::read_notes`]) on those objects, the
+/// objects they owned and the CLASS records of their types.
+pub fn read_sections_left_out(
+    secs: Vec<cadcraft_dxf::Section>,
+    outside: usize,
+    left_out: &LeftOut,
+    trace: &mut dyn FnMut(&'static str),
+) -> Result<Drawing> {
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
@@ -1916,7 +1959,17 @@ pub fn read_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, tr
         d.layers.insert(0, Layer::default());
     }
     trace("foreign data");
-    crate::dxf_raw::read(&secs, &mut d);
+    let owned = crate::dxf_raw::read(&secs, &mut d, &left_out.handles);
+    if !left_out.is_empty() {
+        let classes = secs
+            .iter()
+            .filter(|s| s.name == "CLASSES")
+            .flat_map(|s| record_slices(&s.tags))
+            .filter(|(k, tg)| k == "CLASS" && T(tg).s(1).is_some_and(|n| cadcraft_dwg::is_dgn_line_style(&n)))
+            .count();
+        let left = cadcraft_dwg::DgnLineStylesLeftOut { objects: left_out.dgn_line_styles.clone(), owned, classes };
+        d.read_notes.push(left.note(left_out.cap));
+    }
     d.skipped_records = skipped;
     trace("done");
     Ok(d)

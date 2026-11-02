@@ -24,7 +24,7 @@ use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::Bounds2;
 
 pub use cadcraft_dxf::Version;
-pub use dxf_read::entity_from_groups;
+pub use dxf_read::{LeftOut, ReadOptions, entity_from_groups};
 pub use dxf_write::entity_groups;
 pub use pdf::{PdfOptions, pdf, plot, plot_with_warnings};
 
@@ -60,17 +60,28 @@ fn ext(name: &str) -> String {
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
+    read_with(bytes, name, &ReadOptions::default())
+}
+
+/// [`read`] keeping every object the file has, whatever the cost ([`ReadOptions::keep_all`]).
+pub fn read_all(bytes: &[u8], name: &str) -> Result<Drawing> {
+    read_with(bytes, name, &ReadOptions { keep_all: true })
+}
+
+/// [`read`] under [`ReadOptions`].
+pub fn read_with(bytes: &[u8], name: &str, o: &ReadOptions) -> Result<Drawing> {
     if cadcraft_dwg::is_dwg(bytes) {
-        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
-        let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
+        let limits = if o.keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
+        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, limits).map_err(IoError::Format)?;
+        let mut d = dxf_read::read_with(&dxf, o).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
         // The DWG's notes first, then what reading the DXF text left out.
         d.read_notes.splice(0..0, notes);
         return Ok(d);
     }
     match ext(name).as_str() {
         "svg" | "svgz" => svg_read::read(bytes),
-        "dxf" | "" => dxf_read::read(bytes),
-        e if bytes.len() > 4 => dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string())),
+        "dxf" | "" => dxf_read::read_with(bytes, o),
+        e if bytes.len() > 4 => dxf_read::read_with(bytes, o).map_err(|_| IoError::Unsupported(e.to_string())),
         e => Err(IoError::Unsupported(e.to_string())),
     }
 }
@@ -197,9 +208,10 @@ pub fn dxf_sections(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)>
     dxf_read::sections_of(bytes)
 }
 
-/// [`dxf_sections`] with the notes on what was left out (see [`Drawing::read_notes`]).
-pub fn dxf_sections_noted(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize, Vec<String>)> {
-    dxf_read::sections_noted(bytes)
+/// [`dxf_sections`] under [`ReadOptions`], with the account of what was stepped over
+/// ([`LeftOut`]), for [`read_dxf_sections_left_out`].
+pub fn dxf_sections_left_out(bytes: &[u8], o: &ReadOptions) -> Result<(Vec<cadcraft_dxf::Section>, usize, LeftOut)> {
+    dxf_read::sections_left_out(bytes, dxf_read::dgn_cap(o))
 }
 
 /// [`read_dxf`] from the sections [`dxf_sections`] split, so that a caller can look at the
@@ -212,6 +224,17 @@ pub fn read_dxf_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Re
 /// `done` at the end), for timing them.
 pub fn read_dxf_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
     dxf_read::read_sections_traced(secs, outside, trace)
+}
+
+/// [`read_dxf_sections_traced`] from sections [`dxf_sections_left_out`] split, so that the
+/// drawing's notes account for what was stepped over.
+pub fn read_dxf_sections_left_out(
+    secs: Vec<cadcraft_dxf::Section>,
+    outside: usize,
+    left_out: &LeftOut,
+    trace: &mut dyn FnMut(&'static str),
+) -> Result<Drawing> {
+    dxf_read::read_sections_left_out(secs, outside, left_out, trace)
 }
 /// The drawing as R2000 ASCII DXF, whatever its own version ([`write_with`] chooses one).
 pub fn write_dxf(d: &Drawing) -> String {
