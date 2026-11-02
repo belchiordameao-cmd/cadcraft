@@ -63,7 +63,8 @@ pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
         let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
-        d.read_notes = notes;
+        // The DWG's notes first, then what reading the DXF text left out.
+        d.read_notes.splice(0..0, notes);
         return Ok(d);
     }
     match ext(name).as_str() {
@@ -196,10 +197,21 @@ pub fn dxf_sections(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)>
     dxf_read::sections_of(bytes)
 }
 
+/// [`dxf_sections`] with the notes on what was left out (see [`Drawing::read_notes`]).
+pub fn dxf_sections_noted(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize, Vec<String>)> {
+    dxf_read::sections_noted(bytes)
+}
+
 /// [`read_dxf`] from the sections [`dxf_sections`] split, so that a caller can look at the
 /// groups (counts by record type, say) without parsing the text twice.
 pub fn read_dxf_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
     dxf_read::read_sections(secs, outside)
+}
+
+/// [`read_dxf_sections`] telling `trace` each phase of building the drawing as it starts (and
+/// `done` at the end), for timing them.
+pub fn read_dxf_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
+    dxf_read::read_sections_traced(secs, outside, trace)
 }
 /// The drawing as R2000 ASCII DXF, whatever its own version ([`write_with`] chooses one).
 pub fn write_dxf(d: &Drawing) -> String {

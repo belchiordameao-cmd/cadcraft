@@ -611,6 +611,9 @@ fn perf_open(path: &str) -> Result<(), String> {
             p.header_secs,
             mem_line()
         );
+        for (k, n) in &p.dgn_line_styles_left_out {
+            outln!("  left out of the text: {n} {k}");
+        }
         for n in &notes {
             outln!("  note: {n}");
         }
@@ -620,7 +623,7 @@ fn perf_open(path: &str) -> Result<(), String> {
         bytes
     };
     let t = Instant::now();
-    let (secs, outside) = cadcraft_io::dxf_sections(&dxf).map_err(|e| e.to_string())?;
+    let (secs, outside, notes) = cadcraft_io::dxf_sections_noted(&dxf).map_err(|e| e.to_string())?;
     let tags: usize = secs.iter().map(|s| s.tags.len()).sum();
     outln!(
         "dxf groups: {:.1} s; {} groups in {} sections ({:.0} MB as groups, plus their text), {} outside any section; {}",
@@ -631,6 +634,9 @@ fn perf_open(path: &str) -> Result<(), String> {
         outside,
         mem_line()
     );
+    for n in &notes {
+        outln!("  note: {n}");
+    }
     drop(dxf);
     outln!("after dropping the text: {}", mem_line());
     for s in &secs {
@@ -667,8 +673,11 @@ fn perf_open(path: &str) -> Result<(), String> {
     for (k, (count, groups, text, largest)) in rows.iter().take(20) {
         outln!("  {k:<32} {count:>10} {groups:>12} {:>9.1} {largest:>10}", mb(*text));
     }
+    // The document, phase by phase: each phase's time and the memory when it started.
     let t = Instant::now();
-    let d = cadcraft_io::read_dxf_sections(secs, outside).map_err(|e| e.to_string())?;
+    let mut phases: Vec<(&'static str, Instant, String)> = Vec::new();
+    let d = cadcraft_io::read_dxf_sections_traced(secs, outside, &mut |name| phases.push((name, Instant::now(), mem_line())))
+        .map_err(|e| e.to_string())?;
     outln!(
         "document: {:.1} s; {} entities, {} blocks, {} layers, {} layouts; {}",
         t.elapsed().as_secs_f64(),
@@ -678,6 +687,15 @@ fn perf_open(path: &str) -> Result<(), String> {
         d.layouts.len(),
         mem_line()
     );
+    for (i, (name, start, mem)) in phases.iter().enumerate() {
+        let end = phases.get(i + 1).map_or(*start, |n| n.1);
+        if *name != "done" {
+            outln!("  {name:<18} {:>7.2} s; at start {mem}", end.duration_since(*start).as_secs_f64());
+        }
+    }
+    for n in &d.read_notes {
+        outln!("  note: {n}");
+    }
     outln!("total: {:.1} s", t0.elapsed().as_secs_f64());
     Ok(())
 }

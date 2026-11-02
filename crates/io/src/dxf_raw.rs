@@ -345,11 +345,15 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
             xdict_of.entry(o).or_insert(x);
         }
     }
+    // Each object's head, read once: a dictionary of hundreds of thousands of entries owns as
+    // many objects, and reading its head again for each of them (its entries come before the
+    // end of its groups) made this quadratic.
+    let heads: Vec<Head> = objects.iter().map(|(_, _, t)| head(t)).collect();
     // Objects by handle: the first of each, and none that has an entity's handle.
     let mut by_handle: HashMap<String, usize> = HashMap::new();
-    for (i, (_, _, t)) in objects.iter().enumerate() {
-        if let Some(h) = head(t).handle.filter(|h| handle(h).is_some() && !ents.contains_key(h)) {
-            by_handle.entry(h).or_insert(i);
+    for (i, hd) in heads.iter().enumerate() {
+        if let Some(h) = hd.handle.as_ref().filter(|h| handle(h).is_some() && !ents.contains_key(*h)) {
+            by_handle.entry(h.clone()).or_insert(i);
         }
     }
     let root = objects.first().filter(|(k, _, _)| is_dictionary(k)).and_then(|(_, _, t)| head(t).handle);
@@ -357,12 +361,12 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
     let root_key = |h: &str| root_entries.iter().find(|(_, eh)| eh == h).map(|(k, _)| k.clone());
     // An extension dictionary of an entity or record (not of another object).
     let is_xdict = |k: usize| {
-        let Some((_, _, t)) = objects.get(k) else { return false };
-        let hd = head(t);
-        let (Some(h), Some(o)) = (hd.handle, hd.owner) else { return false };
-        !by_handle.contains_key(&o) && xdict_of.get(&o) == Some(&h) && (ents.contains_key(&o) || ids.contains_key(&o))
+        let Some(hd) = heads.get(k) else { return false };
+        let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { return false };
+        !by_handle.contains_key(o) && xdict_of.get(o) == Some(h) && (ents.contains_key(o) || ids.contains_key(o))
     };
-    let modelled_entry = |t: &[Tag], h: &str| entries(t).iter().any(|(k, eh)| eh == h && MODELLED_XDICT_KEYS.contains(&up(k).as_str()));
+    // The objects an extension dictionary lists under a modelled key, per dictionary, read once.
+    let mut modelled_in: HashMap<usize, HashSet<String>> = HashMap::new();
     // Which objects to keep: those under a named object dictionary entry CADCraft doesn't model,
     // under the extension dictionary of an entity or record (minus modelled entries; one left
     // empty goes), or owned by an entity of a type CADCraft doesn't model. Memoized along each
@@ -379,26 +383,32 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
                 break false;
             }
             path.push(cur);
-            let Some((_, _, t)) = objects.get(cur) else { break false };
-            let hd = head(t);
-            let (Some(h), Some(o)) = (hd.handle, hd.owner) else { break false };
-            if by_handle.get(&h) != Some(&cur) {
+            let Some(hd) = heads.get(cur) else { break false };
+            let (Some(h), Some(o)) = (&hd.handle, &hd.owner) else { break false };
+            if by_handle.get(h) != Some(&cur) {
                 break false;
             }
-            if Some(&o) == root.as_ref() {
-                break root_key(&h).is_some_and(|k| !modelled_key(&k));
+            if Some(o) == root.as_ref() {
+                break root_key(h).is_some_and(|k| !modelled_key(&k));
             }
-            if let Some(&j) = by_handle.get(&o) {
-                if is_xdict(j) && objects.get(j).is_some_and(|p| modelled_entry(p.2, &h)) {
-                    break false;
+            if let Some(&j) = by_handle.get(o) {
+                if is_xdict(j) {
+                    let listed = modelled_in.entry(j).or_insert_with(|| {
+                        let entries = objects.get(j).map(|(_, _, p)| entries(p)).unwrap_or_default();
+                        entries.into_iter().filter(|(k, _)| MODELLED_XDICT_KEYS.contains(&up(k).as_str())).map(|(_, eh)| eh).collect()
+                    });
+                    if listed.contains(h) {
+                        break false;
+                    }
                 }
                 cur = j;
                 continue;
             }
             if is_xdict(cur) {
+                let Some((_, _, t)) = objects.get(cur) else { break false };
                 break entries(t).iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str()));
             }
-            break ents.get(&o) == Some(&true);
+            break ents.get(o) == Some(&true);
         };
         for p in path {
             memo.insert(p, verdict);
@@ -410,12 +420,12 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing) {
         if memo.get(&i) != Some(&true) || f.objects.len() >= MAX_OBJECTS {
             continue;
         }
-        let Some(h) = head(t).handle.and_then(|h| handle(&h)) else { continue };
+        let Some(h) = heads.get(i).and_then(|hd| hd.handle.as_deref()).and_then(handle) else { continue };
         let mut tags: Vec<RawTag> = t.iter().map(raw).collect();
         if is_xdict(i) {
             strip_entries(&mut tags);
         }
-        if head(t).owner == root
+        if heads.get(i).is_some_and(|hd| hd.owner == root)
             && let Some(key) = root_key(&h.hex())
         {
             f.dictionary.push((key, h));
