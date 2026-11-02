@@ -495,7 +495,9 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             layer_colors: crate::dxf_ext::read_layer_colors(tags),
             // Status flags: 65536 = non-rectangular clipping (by the 340 entity), 131072 = off.
             clip: t.s(340).and_then(|h| Handle::parse_hex(&h)).filter(|h| h.0 != 0 && t.i(90).unwrap_or(0) & 65536 != 0),
-            on: t.i(90).unwrap_or(0) & 131072 == 0,
+            // Off when the status flags say so, or when status 68 is 0 (the DXF Reference: 0 =
+            // off, a positive value the stacking order; some writers set only one of the two).
+            on: t.i(90).unwrap_or(0) & 131072 == 0 && t.i(68).is_none_or(|v| v != 0),
         }),
         "WIPEOUT" => {
             let o = t.p(10);

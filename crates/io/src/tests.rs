@@ -2417,6 +2417,33 @@ fn path_points(content: &str) -> Vec<Vec2> {
 }
 
 #[test]
+fn viewport_status_68_zero_reads_as_off() {
+    // The DXF Reference: status 68 = 0 is a viewport that is off, whatever the flags say.
+    let (_, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let mut q = p.clone();
+    let mut seen = false;
+    for t in &mut q[r] {
+        if t.0 == "68" {
+            t.1 = "0".into();
+            seen = true;
+        }
+    }
+    assert!(seen, "the writer gives viewports a status 68");
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    let on = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .find_map(|e| match &e.kind {
+            EntityKind::Viewport(v) if v.id == 2 => Some(v.on),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!on);
+}
+
+#[test]
 fn pdf_layout_plot_area_extents_fits_and_centres_the_sheet_contents() {
     let mut d = Drawing::new_metric();
     let paper = Space::Paper(d.layouts[0].name.clone());
