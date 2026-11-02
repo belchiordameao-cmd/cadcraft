@@ -409,8 +409,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, canvas: Rect) {
         let lh = 16.0;
         let hr = Rect::from_min_size(pos2(bar.left(), bar.top() - lh * lines.len() as f32 - 4.0), vec2(w, lh * lines.len() as f32 + 2.0));
         p.rect_filled(hr, 3.0, t.cmd_history);
+        // A line longer than the strip ends in an ellipsis; the expanded history (F2) has the
+        // rest, on hover.
+        let font = crate::theme::small();
+        let fits = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), t.text_dim).rect.width() <= w - 16.0;
         for (i, l) in lines.iter().enumerate() {
-            p.text(pos2(hr.left() + 8.0, hr.top() + 1.0 + lh * i as f32), egui::Align2::LEFT_TOP, l, crate::theme::small(), t.text_dim);
+            p.text(pos2(hr.left() + 8.0, hr.top() + 1.0 + lh * i as f32), egui::Align2::LEFT_TOP, elide(l, fits), font.clone(), t.text_dim);
         }
     }
     p.rect_filled(bar, 3.0, t.cmd_bg);
@@ -635,12 +639,39 @@ fn history_window(app: &CadApp, ui: &mut egui::Ui, r: Rect) {
         log.len(),
         |ui, rows| {
             for l in log.get(rows).into_iter().flatten() {
-                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LINE_H), Sense::hover());
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), LINE_H), Sense::hover());
                 let p = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
-                p.text(pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, l, crate::theme::small(), t.text_dim);
+                let font = crate::theme::small();
+                // A line longer than the window ends in an ellipsis and shows whole on hover.
+                let fits = |s: &str| p.layout_no_wrap(s.to_string(), font.clone(), t.text_dim).rect.width() <= row.width();
+                let shown = elide(l, fits);
+                if shown.len() < l.len() {
+                    resp.on_hover_text(l.clone());
+                }
+                p.text(pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, shown, font, t.text_dim);
             }
         },
     );
+}
+
+/// `text` as it is when `fits` says so, else its longest head that fits with an ellipsis (found
+/// by halving, so a long warning costs a handful of measurements).
+fn elide(text: &str, fits: impl Fn(&str) -> bool) -> String {
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let head = |n: usize| -> String { chars.iter().take(n).collect::<String>() + "…" };
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(&head(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    head(lo)
 }
 
 #[cfg(test)]
@@ -648,6 +679,16 @@ mod tests {
     use super::*;
     use cadcraft_engine::Session;
     use egui::{Event, PointerButton};
+
+    #[test]
+    fn elide_keeps_what_fits_and_ends_a_long_line_with_an_ellipsis() {
+        let fits = |s: &str| s.chars().count() <= 10;
+        assert_eq!(elide("short", fits), "short");
+        assert_eq!(elide("exactly 10", fits), "exactly 10");
+        assert_eq!(elide("a line that is too long for the strip", fits), "a line th…");
+        assert_eq!(elide("", |_| false), "…");
+        assert_eq!(elide("ação com acentos e mais", |s| s.chars().count() <= 6), "ação …");
+    }
 
     #[test]
     fn compact_canvas_contains_history_controls_without_changing_line_preference() {
