@@ -1001,7 +1001,7 @@ mod tests {
         let r = layouts_report(&s).unwrap();
         let l = r["layouts"].as_array().unwrap().iter().find(|l| l["name"] == "S").unwrap();
         assert!(!l["viewports"].as_array().unwrap().is_empty());
-        assert!(l["page"]["width_mm"].as_f64().unwrap() > 0.0);
+        assert!(l["page"]["widthMm"].as_f64().unwrap() > 0.0);
     }
 
     fn args(values: &[&str]) -> Vec<String> {
