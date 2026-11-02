@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 /// What a DXF file holds that CADCraft doesn't model, kept and written back (#528).
+mod dwg_check;
 mod dxf_raw;
 
 mod dxf_ext;
@@ -120,6 +121,25 @@ pub fn write_with(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<Vec<u8>
         e if opts.binary => Err(IoError::Format(format!("binary output is for DXF files, not `{e}`"))),
         _ => write_framed(d, name, None),
     }
+}
+
+/// [`write_with`], with what the file written lacks. A DWG is read back through the bridge and
+/// its records counted against the text it was written from: the bridge can leave records out
+/// without a word (a real drawing lost a block reference, its attribute and its block that way),
+/// so the loss is reported as a warning, like a plot's blank page. DXF and the image formats
+/// have nothing to report. Reading the DWG back costs about what opening it does.
+pub fn write_with_warnings(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<String>)> {
+    if ext(name) != "dwg" || opts.binary {
+        return write_with(d, name, opts).map(|b| (b, Vec::new()));
+    }
+    let version = opts.version.unwrap_or_else(|| save_version(d).max(Version::R2004));
+    let text = dxf_write::dwg_bridge(d, version);
+    let bytes = cadcraft_dwg::dxf_to_dwg_as(text.as_bytes(), version.code()).map_err(IoError::Format)?;
+    let warnings = match cadcraft_dwg::dwg_to_dxf_noted(&bytes, cadcraft_dwg::Limits::DEFAULT) {
+        Ok((back, _)) => dwg_check::dwg_loss(text.as_bytes(), &back),
+        Err(e) => vec![format!("The DWG written could not be read back ({e}): whether it kept everything is not known.")],
+    };
+    Ok((bytes, warnings))
 }
 
 /// Like [`write`], but image formats (PNG, SVG, PDF) show `window` (a model-space rectangle in
