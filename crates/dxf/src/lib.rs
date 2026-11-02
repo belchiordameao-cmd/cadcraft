@@ -275,7 +275,8 @@ trait Sink {
     fn skipping(&self) -> bool {
         false
     }
-    /// The handle (group 5) of a record that is left out, as it goes by.
+    /// The handle (group 5) of a record that is left out, or of something it hard-owns (a
+    /// 360 group: its extension dictionary), as it goes by.
     fn skipped_handle(&mut self, _handle: &str) {}
 }
 
@@ -304,7 +305,7 @@ fn parse_ascii_into(text: &str, max_tags: usize, sink: &mut impl Sink) -> Result
             return Err(DxfError::TooLarge { tags: n, limit: max_tags });
         }
         if code != 0 && sink.skipping() {
-            if code == 5 {
+            if code == 5 || code == 360 {
                 sink.skipped_handle(val.trim());
             }
             continue;
@@ -407,7 +408,7 @@ fn parse_binary_into(b: &[u8], max_tags: usize, sink: &mut impl Sink) -> Result<
             match kind_of(code) {
                 Kind::Str => {
                     let s = c.cstr()?;
-                    if code == 5 {
+                    if code == 5 || code == 360 {
                         sink.skipped_handle(String::from_utf8_lossy(s).trim());
                     }
                 }
@@ -665,7 +666,8 @@ pub struct Parsed {
     pub outside: usize,
     /// Records left out, by type in the order the types were first met, with how many of each.
     pub skipped: Vec<(String, usize)>,
-    /// The handles (group 5, upper case) of the records left out, for what they owned.
+    /// The handles (upper case) of the records left out (group 5) and of what they hard-own
+    /// (360 groups: an extension dictionary), for what goes with them.
     pub skipped_handles: Vec<String>,
 }
 
@@ -882,7 +884,7 @@ mod tests {
 
     #[test]
     fn parse_sections_leaves_the_skipped_record_types_out_and_counts_them() {
-        let text = "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n3\nK\n350\nD\n0\nLSINTERNALCOMPONENT\n5\nD\n330\nC\n100\nAcDbLSInternalComponent\n40\n1.5\n310\nAB\n290\n1\n0\nXRECORD\n5\nE\n0\nLSINTERNALCOMPONENT\n5\nF\n0\nLSDEFINITION\n5\n10\n0\nENDSEC\n0\nEOF\n";
+        let text = "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n3\nK\n350\nD\n0\nLSINTERNALCOMPONENT\n5\nD\n102\n{ACAD_XDICTIONARY\n360\n2A\n102\n}\n330\nC\n100\nAcDbLSInternalComponent\n40\n1.5\n310\nAB\n290\n1\n0\nXRECORD\n5\nE\n0\nLSINTERNALCOMPONENT\n5\nF\n0\nLSDEFINITION\n5\n10\n0\nENDSEC\n0\nEOF\n";
         let skip = |k: &str| k.starts_with("LS");
         let tags = parse_ascii(text).unwrap();
         for bytes in [text.as_bytes().to_vec(), write_binary(&tags, true)] {
@@ -891,7 +893,7 @@ mod tests {
             assert_eq!(kinds, ["DICTIONARY", "XRECORD"]);
             assert_eq!(p.sections[0].tags.len(), 1 + 3 + 1 + 1);
             assert_eq!(p.skipped, vec![("LSINTERNALCOMPONENT".to_string(), 2), ("LSDEFINITION".to_string(), 1)]);
-            assert_eq!(p.skipped_handles, ["D", "F", "10"]);
+            assert_eq!(p.skipped_handles, ["D", "2A", "F", "10"]);
             // The limit counts the skipped groups too: the file is what it is.
             let n = tags.len();
             assert!(parse_sections_with_limit(&bytes, n - 1, &skip).is_err());

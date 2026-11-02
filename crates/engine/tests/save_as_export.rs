@@ -55,6 +55,7 @@ fn saving_a_drawing_file_warns_about_what_reading_left_out() {
     std::sync::Arc::make_mut(&mut s.docs[s.active].doc).read_notes = vec!["12 things were left out".into()];
     let r = s.execute("saveas", &json!({ "path": dir.join("a.dxf").to_string_lossy() })).unwrap();
     assert_eq!(r["warnings"], json!(["12 things were left out"]));
+    assert!(s.log.iter().any(|l| l == "Warning: 12 things were left out"), "{:?}", s.log);
     let r = s.execute("qsave", &json!({})).unwrap();
     assert_eq!(r["warnings"], json!(["12 things were left out"]));
     let r = s.execute("saveas", &json!({ "path": dir.join("a.dwg").to_string_lossy() })).unwrap();

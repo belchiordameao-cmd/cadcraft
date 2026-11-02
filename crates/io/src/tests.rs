@@ -2257,15 +2257,20 @@ fn declared_plot_style_names_are_kept_whether_used_or_not() {
 // ---------- DGN line-style objects and the raw keeper's cost ----------
 
 /// A DXF whose named object dictionary owns a DGN line-style component dictionary of `n`
-/// internal components (the shape a DGN import leaves behind), the first of them owning an
-/// extension dictionary with an XRECORD, plus another dictionary holding one XRECORD and the
-/// CLASS record of the components; `header` adds a HEADER section (the DWG bridge wants one).
+/// internal components (the shape a DGN import leaves behind): the first owns an extension
+/// dictionary with an XRECORD; the second links to one whose own owner group is null (as a
+/// DWG reader may leave it); a DGN linetype's extension dictionary holds the third and nothing
+/// else; plus another dictionary holding one XRECORD and the CLASS record of the components.
+/// `header` adds a HEADER section (the DWG bridge wants one).
 fn dgn_line_style_dxf(n: usize, header: bool) -> String {
     let mut s = String::new();
     if header {
         s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFFF\n0\nENDSEC\n";
     }
     s += "0\nSECTION\n2\nCLASSES\n0\nCLASS\n1\nLSINTERNALCOMPONENT\n2\nAcDbLSInternalComponent\n3\nObjectDBX Classes\n90\n0\n91\n1\n280\n0\n281\n0\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n5\n5\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nLTYPE\n5\n50\n102\n{ACAD_XDICTIONARY\n360\n207\n102\n}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\nDGN_A\n70\n0\n3\nfrom DGN\n72\n65\n73\n0\n40\n0.0\n\
+0\nENDTAB\n0\nENDSEC\n";
     s += "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n\
 3\nACAD_DGNLINESTYLECOMP\n350\n200\n3\nMY_DATA\n350\n201\n\
 0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n";
@@ -2275,9 +2280,16 @@ fn dgn_line_style_dxf(n: usize, header: bool) -> String {
     s += "0\nDICTIONARY\n5\n201\n330\nC\n100\nAcDbDictionary\n281\n1\n3\nK\n360\n202\n\
 0\nXRECORD\n5\n202\n330\n201\n100\nAcDbXrecord\n280\n1\n1\nkept\n\
 0\nDICTIONARY\n5\n203\n330\n1000\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nOF_A_COMPONENT\n360\n204\n\
-0\nXRECORD\n5\n204\n330\n203\n100\nAcDbXrecord\n280\n1\n1\nof a component\n";
+0\nXRECORD\n5\n204\n330\n203\n100\nAcDbXrecord\n280\n1\n1\nof a component\n\
+0\nDICTIONARY\n5\n205\n330\n0\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nOF_ANOTHER\n360\n206\n\
+0\nXRECORD\n5\n206\n330\n205\n100\nAcDbXrecord\n280\n1\n1\nof another\n\
+0\nDICTIONARY\n5\n207\n330\n50\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nACAD_DGNLS\n360\n1002\n";
     for i in 0..n {
-        let xdict = if i == 0 { "102\n{ACAD_XDICTIONARY\n360\n203\n102\n}\n" } else { "" };
+        let xdict = match i {
+            0 => "102\n{ACAD_XDICTIONARY\n360\n203\n102\n}\n",
+            1 => "102\n{ACAD_XDICTIONARY\n360\n205\n102\n}\n",
+            _ => "",
+        };
         s += &format!(
             "0\nLSINTERNALCOMPONENT\n5\n{:X}\n{xdict}330\n200\n100\nAcDbLSInternalComponent\n1\nC{i}\n90\n2\n91\n1\n310\n00\n40\n1.0\n280\n0\n\
              290\n0\n291\n0\n92\n0\n41\n0.0\n42\n0.0\n281\n0\n93\n0\n96\n1\n97\n0\n297\n0\n98\n0\n",
@@ -2307,7 +2319,7 @@ fn dgn_line_style_objects_are_kept_up_to_the_cap_and_left_out_beyond_it() {
     let d = read_dxf(dgn_line_style_dxf(max, false).as_bytes()).unwrap();
     assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
     let kept = |d: &Drawing, kind: &str| d.foreign.objects.iter().filter(|o| o.kind == kind).count();
-    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max, 3, 2));
+    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max, 4, 2));
     let out = write_dxf(&d);
     assert_eq!(dxf_records(&out, "LSINTERNALCOMPONENT"), max);
     assert_eq!((dxf_groups(&out, "3", "LS_0"), dxf_groups(&out, "1", "of a component"), dxf_groups(&out, "1", "LSINTERNALCOMPONENT")), (1, 1, 1));
@@ -2319,8 +2331,8 @@ fn dgn_line_style_objects_are_kept_up_to_the_cap_and_left_out_beyond_it() {
     assert_eq!(
         note,
         &format!(
-            "{n} DGN line-style objects were left out ({n} LSINTERNALCOMPONENT), with 2 objects they owned (1 DICTIONARY, 1 XRECORD) \
-             and the 1 CLASS record of their types: a drawing keeps at most {max} unless opened keeping every object. \
+            "{n} DGN line-style objects were left out ({n} LSINTERNALCOMPONENT), with 5 objects that go with them (3 DICTIONARY, 2 XRECORD; \
+             1 LTYPE loses its extension dictionary) and the 1 CLASS record of their types: a drawing keeps at most {max} unless opened keeping every object. \
              The drawing opens and plots without them; a file saved from it has no DGN line styles (their linetypes stay)."
         )
     );
@@ -2333,7 +2345,7 @@ fn dgn_line_style_objects_are_kept_up_to_the_cap_and_left_out_beyond_it() {
     // Opened keeping every object, the file keeps them all, whatever their number.
     let d = crate::read_with(dgn_line_style_dxf(max + 1, false).as_bytes(), "dgn.dxf", &crate::ReadOptions { keep_all: true }).unwrap();
     assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
-    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max + 1, 3, 2));
+    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max + 1, 4, 2));
     assert_eq!(dxf_records(&write_dxf(&d), "LSINTERNALCOMPONENT"), max + 1);
 }
 
@@ -2345,29 +2357,72 @@ fn dwg_with_more_dgn_line_styles_than_kept_opens_without_them() {
     let max = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS;
     let dwg = cadcraft_dwg::dxf_to_dwg(dgn_line_style_dxf(max + 1, true).as_bytes()).unwrap();
     let (dxf, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::DEFAULT).unwrap();
-    assert_eq!(probe.dgn_line_styles_left_out, vec![("LSINTERNALCOMPONENT".to_string(), max + 1)]);
-    assert_eq!(probe.left_out_with_them, vec![("DICTIONARY".to_string(), 1), ("XRECORD".to_string(), 1)]);
+    assert!(notes.is_empty(), "the reader of the text makes the note: {notes:?}");
+    let left = probe.dgn_line_styles.clone().unwrap_or_default();
+    assert_eq!(left.objects, vec![("LSINTERNALCOMPONENT".to_string(), max + 1)]);
+    // The first component's extension dictionary and its xrecord go by owner; the second's,
+    // whose own owner group is null, by the link from the component; the linetype's, by being
+    // left with no entry but the third component.
+    assert_eq!(left.with_them, vec![("DICTIONARY".to_string(), 3), ("XRECORD".to_string(), 2)], "{left:?}");
+    assert_eq!(left.emptied_of, vec!["50".to_string()], "the linetype whose extension dictionary held only a component");
+    assert!(["1000", "203", "204", "205", "206", "207"].iter().all(|h| left.handles.contains(*h)), "{:?}", left.handles.len());
     let text = String::from_utf8_lossy(&dxf);
-    assert_eq!((dxf_records(&text, "LSINTERNALCOMPONENT"), dxf_groups(&text, "1", "of a component")), (0, 0));
-    let note =
-        notes.iter().find(|n| n.starts_with(&format!("{} DGN line-style objects were left out", max + 1))).unwrap_or_else(|| panic!("{notes:?}"));
-    assert!(note.contains(", with 2 objects they owned (1 DICTIONARY, 1 XRECORD)"), "{note}");
+    assert_eq!(
+        (dxf_records(&text, "LSINTERNALCOMPONENT"), dxf_groups(&text, "1", "of a component"), dxf_groups(&text, "1", "of another")),
+        (0, 0, 0)
+    );
     let d = read(&dwg, "dgn.dwg").unwrap();
-    assert!(d.read_notes.iter().any(|n| n.contains("DGN line-style objects were left out")), "{:?}", d.read_notes);
+    let note = d.read_notes.iter().find(|n| n.contains("DGN line-style objects were left out")).unwrap_or_else(|| panic!("{:?}", d.read_notes));
+    assert!(note.contains(", with 5 objects that go with them (3 DICTIONARY, 2 XRECORD; 1 LTYPE loses its extension dictionary)"), "{note}");
     assert!(d.foreign.objects.iter().all(|o| o.kind != "LSINTERNALCOMPONENT"));
     // Keeping every object, they come through the DWG.
     let (_, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::KEEPING_ALL).unwrap();
-    assert!(probe.dgn_line_styles_left_out.is_empty() && notes.is_empty(), "{notes:?}");
+    assert!(probe.dgn_line_styles.is_none() && notes.is_empty(), "{notes:?}");
     let d = crate::read_all(&dwg, "dgn.dwg").unwrap();
     assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
     assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), max + 1);
+}
 
-    // Up to the cap they come through the DWG like any other object.
-    let dwg = cadcraft_dwg::dxf_to_dwg(dgn_line_style_dxf(5, true).as_bytes()).unwrap();
-    let (_, _, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::DEFAULT).unwrap();
-    assert!(probe.dgn_line_styles_left_out.is_empty());
-    let d = read(&dwg, "dgn.dwg").unwrap();
-    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), 5);
+/// What the DWG bridge dropped with the line-style objects is counted by handle, not by the
+/// text: acadrust writes a dictionary whose owner is gone as owned by the root dictionary, and
+/// a dictionary without the entries that named gone objects, so the text alone would show an
+/// orphan under the root and an empty extension dictionary, and nothing would be said. The
+/// text's own evidence counts too: an extension dictionary whose entries all name a gone
+/// handle goes with them.
+#[test]
+fn objects_the_dwg_bridge_dropped_with_the_line_styles_are_counted_by_handle() {
+    let dxf = "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n5\n5\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nLTYPE\n5\n50\n102\n{ACAD_XDICTIONARY\n360\n500\n102\n}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\nDGN_A\n70\n0\n3\n\n72\n65\n73\n0\n40\n0.0\n\
+0\nENDTAB\n0\nENDSEC\n\
+0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_DGNLINESTYLECOMP\n350\n200\n\
+0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n\
+0\nDICTIONARY\n5\n300\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nK\n360\n301\n\
+0\nXRECORD\n5\n301\n330\n300\n100\nAcDbXrecord\n280\n1\n1\nwas a definition's\n\
+0\nDICTIONARY\n5\n400\n330\n1234\n100\nAcDbDictionary\n280\n1\n281\n1\n\
+0\nDICTIONARY\n5\n500\n330\n50\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nACAD_DGNLS\n360\n1234\n\
+0\nENDSEC\n0\nEOF\n";
+    let (secs, outside, _) = crate::dxf_sections_left_out(dxf.as_bytes(), &crate::ReadOptions::default()).unwrap();
+    let left_out = crate::LeftOut {
+        dgn_line_styles: vec![("LSDEFINITION".into(), 14)],
+        handles: ["1234".to_string(), "300".to_string()].into_iter().collect(),
+        with_them: vec![("DICTIONARY".into(), 1)],
+        emptied_of: vec!["50".into()],
+        cap: 10_000,
+    };
+    let d = crate::read_dxf_sections_left_out(secs, outside, &left_out, &mut |_| {}).unwrap();
+    assert_eq!(d.read_notes.len(), 1, "{:?}", d.read_notes);
+    // The bridge's one; the dictionary the text shows under the root (handle listed) and its
+    // xrecord; the dictionary whose owner is a listed handle; the linetype's extension
+    // dictionary left with no entry but a listed handle.
+    assert!(
+        d.read_notes[0].starts_with(
+            "14 DGN line-style objects were left out (14 LSDEFINITION), with 5 objects that go with them (4 DICTIONARY, 1 XRECORD; 2 LTYPE lose their extension dictionaries)"
+        ),
+        "{}",
+        d.read_notes[0]
+    );
+    assert!(d.foreign.objects.iter().all(|o| !matches!(o.handle.hex().as_str(), "300" | "301" | "400" | "500")), "{:?}", d.foreign.objects);
+    assert!(d.foreign.objects.iter().any(|o| o.handle.hex() == "200"), "the root's own entry stays");
 }
 
 /// Building the drawing reports its phases in order, first to last.

@@ -1685,12 +1685,19 @@ pub fn read_with(bytes: &[u8], o: &ReadOptions) -> Result<Drawing> {
     read_sections_left_out(secs, outside, &left_out, &mut |_| {})
 }
 
-/// What [`sections_left_out`] stepped over: DGN line-style objects beyond the cap, by type,
-/// their handles (the objects they owned go with them), and the cap the file passed.
+/// What was left out before the drawing was built: DGN line-style objects beyond the cap
+/// ([`sections_left_out`] stepping over them, or the DWG bridge dropping them), by type; the
+/// upper-case hex handles of those objects and of what they hard-owned, so that an object
+/// whose owner, or own handle, is one of them goes with them; what the DWG bridge already
+/// dropped with them, by type; and the cap the file passed.
 #[derive(Clone, Debug, Default)]
 pub struct LeftOut {
     pub dgn_line_styles: Vec<(String, usize)>,
     pub handles: HashSet<String>,
+    pub with_them: Vec<(String, usize)>,
+    /// The owners (upper-case hex handles) of the extension dictionaries the bridge dropped
+    /// for holding only them: named by record type in the note.
+    pub emptied_of: Vec<String>,
     pub cap: usize,
 }
 
@@ -1723,7 +1730,16 @@ pub fn sections_left_out(bytes: &[u8], max: usize) -> Result<(Vec<cadcraft_dxf::
         return Ok((p.sections, p.outside, LeftOut::default()));
     }
     let handles = p.skipped_handles.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
-    Ok((p.sections, p.outside, LeftOut { dgn_line_styles: p.skipped, handles, cap: max }))
+    Ok((p.sections, p.outside, LeftOut { dgn_line_styles: p.skipped, handles, with_them: Vec::new(), emptied_of: Vec::new(), cap: max }))
+}
+
+/// What the DWG bridge left out of a file's DXF text ([`cadcraft_dwg::DwgProbe::dgn_line_styles`]),
+/// as the account the reader of that text takes; `None` when it left nothing out.
+pub fn left_out_from_dwg(probe: &cadcraft_dwg::DwgProbe, max: usize) -> Option<LeftOut> {
+    let l = probe.dgn_line_styles.as_ref()?;
+    let handles = l.handles.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    let emptied_of = l.emptied_of.iter().filter_map(|h| Handle::parse_hex(h)).map(|h| h.hex()).collect();
+    Some(LeftOut { dgn_line_styles: l.objects.clone(), handles, with_them: l.with_them.clone(), emptied_of, cap: max })
 }
 
 /// [`read`] from a file's sections ([`sections_of`]).
@@ -1959,7 +1975,7 @@ pub fn read_sections_left_out(
         d.layers.insert(0, Layer::default());
     }
     trace("foreign data");
-    let owned = crate::dxf_raw::read(&secs, &mut d, &left_out.handles);
+    let (gone, emptied) = crate::dxf_raw::read(&secs, &mut d, &left_out.handles, &left_out.emptied_of);
     if !left_out.is_empty() {
         let classes = secs
             .iter()
@@ -1967,8 +1983,23 @@ pub fn read_sections_left_out(
             .flat_map(|s| record_slices(&s.tags))
             .filter(|(k, tg)| k == "CLASS" && T(tg).s(1).is_some_and(|n| cadcraft_dwg::is_dgn_line_style(&n)))
             .count();
-        let left = cadcraft_dwg::DgnLineStylesLeftOut { objects: left_out.dgn_line_styles.clone(), owned, classes };
-        d.read_notes.push(left.note(left_out.cap));
+        // What the DWG bridge dropped with them, and what the text still showed as theirs.
+        let mut owned = left_out.with_them.clone();
+        for (k, n) in gone {
+            match owned.iter_mut().find(|(x, _)| *x == k) {
+                Some((_, m)) => *m = m.saturating_add(n),
+                None => owned.push((k, n)),
+            }
+        }
+        owned.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let left = cadcraft_dwg::DgnLineStylesLeftOut {
+            objects: left_out.dgn_line_styles.clone(),
+            with_them: owned,
+            handles: HashSet::new(),
+            emptied_of: Vec::new(),
+            emptied,
+        };
+        d.read_notes.push(left.note(classes, left_out.cap));
     }
     d.skipped_records = skipped;
     trace("done");

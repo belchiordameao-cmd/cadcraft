@@ -325,9 +325,13 @@ fn put_xdata(d: &mut Drawing, mut xdata: HashMap<Handle, Vec<RawTag>>) {
 }
 
 /// Keep what `secs` holds that the reader did not model in `d.foreign`. Objects owned by one of
-/// the `gone` handles (records the parser stepped over) go with it: they are not kept, and are
-/// returned counted by type.
-pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) -> Vec<(String, usize)> {
+/// the `gone` handles (records the parser stepped over, or the DWG bridge dropped), whose own
+/// handle is one (an extension dictionary of such a record), or an extension dictionary whose
+/// entries all named one (a DGN linetype's, holding its definition), go with it: they are not
+/// kept, and are returned counted by type, with the record types of what lost an extension
+/// dictionary that way (those found here, and the owners in `emptied_of`, which the DWG bridge
+/// found before writing the text).
+pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>, emptied_of: &[String]) -> (Vec<(String, usize)>, Vec<(String, usize)>) {
     let get = |name: &str| secs.iter().find(|s| s.name == name).map(|s| split(&s.tags)).unwrap_or_default();
     let (classes, tables, blocks, entities, objects) = (get("CLASSES"), get("TABLES"), get("BLOCKS"), get("ENTITIES"), get("OBJECTS"));
     // The drawing's entities by handle: whether each is of a type CADCraft doesn't model.
@@ -336,6 +340,19 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) ->
         ents.entry(e.handle.hex()).or_insert(matches!(e.kind, EntityKind::Unknown(_)));
     }
     let ids = identities(&tables, &blocks, &objects);
+    // The record type of a handle an extension dictionary belongs to: a table record or block
+    // by its role, an entity by its record.
+    let entity_kinds: HashMap<String, String> = blocks.iter().chain(&entities).filter_map(|(k, _, t)| Some((head(t).handle?, k.clone()))).collect();
+    let kind_of_owner =
+        |h: &str| -> String { ids.get(h).map(|k| k.0.clone()).or_else(|| entity_kinds.get(h).cloned()).unwrap_or_else(|| "OBJECT".to_string()) };
+    let mut emptied: Vec<(String, usize)> = Vec::new();
+    let bump = |counts: &mut Vec<(String, usize)>, k: String| match counts.iter_mut().find(|(x, _)| *x == k) {
+        Some((_, n)) => *n = n.saturating_add(1),
+        None => counts.push((k, 1)),
+    };
+    for h in emptied_of {
+        bump(&mut emptied, kind_of_owner(h));
+    }
     // Extension dictionaries of entities and records: owner → dictionary.
     let mut xdict_of: HashMap<String, String> = HashMap::new();
     for (kind, _, t) in tables.iter().chain(&blocks).chain(&entities) {
@@ -398,6 +415,9 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) ->
             if by_handle.get(h) != Some(&cur) {
                 break Verdict::Drop;
             }
+            if gone.contains(h) {
+                break Verdict::Gone;
+            }
             if Some(o) == root.as_ref() {
                 break keep_if(root_key(h).is_some_and(|k| !modelled_key(&k)));
             }
@@ -419,7 +439,12 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) ->
             }
             if is_xdict(cur) {
                 let Some((_, _, t)) = objects.get(cur) else { break Verdict::Drop };
-                break keep_if(entries(t).iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str())));
+                let es = entries(t);
+                if !es.is_empty() && es.iter().all(|(_, eh)| gone.contains(eh)) {
+                    bump(&mut emptied, kind_of_owner(o));
+                    break Verdict::Gone;
+                }
+                break keep_if(es.iter().any(|(k, _)| !MODELLED_XDICT_KEYS.contains(&up(k).as_str())));
             }
             break keep_if(ents.get(o) == Some(&true));
         };
@@ -526,7 +551,8 @@ pub(crate) fn read(secs: &[Section], d: &mut Drawing, gone: &HashSet<String>) ->
     if !f.is_empty() {
         d.foreign = Arc::new(f);
     }
-    with_them
+    emptied.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    (with_them, emptied)
 }
 
 /// Most groups of a data store section kept (a damaged file's can be endless).
