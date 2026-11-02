@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use cadcraft_color::Color;
 use cadcraft_doc::*;
 use cadcraft_dxf::{Tag, Version};
-use cadcraft_geom::{Bounds2, Vec2, Vec3};
+use cadcraft_geom::{Bounds2, Mat3, Vec2, Vec3};
 
 use crate::dxf_ext::{self, DimVal, K};
 
@@ -822,7 +822,10 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                             let mut t = a.text.clone();
                             t.insert = t.insert + *off;
                             t.align_pt = t.align_pt.map(|p| p + *off);
-                            moved = Attrib { text: t, ..a.clone() };
+                            let mut m = Attrib { text: t, ..a.clone() };
+                            // A multiline attribute's text has an insertion point of its own.
+                            m.transform_multiline(&Mat3::translate(Vec2::new(off.x, off.y)));
+                            moved = m;
                             &moved
                         };
                         let ah = w.h();
