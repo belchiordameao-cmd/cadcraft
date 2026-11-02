@@ -261,9 +261,33 @@ pub fn parse_ascii(text: &str) -> Result<Vec<Tag>> {
     parse_ascii_with_limit(text, MAX_TAGS)
 }
 
-#[allow(clippy::while_let_loop)]
 fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
     let mut tags = Vec::new();
+    parse_ascii_into(text, max_tags, &mut tags)?;
+    Ok(tags)
+}
+
+/// Where the groups a parser reads go: a tag list, or the sections of [`parse_sections`].
+trait Sink {
+    fn take(&mut self, t: Tag);
+    /// True while a record that is left out goes by: the parser then skips its values without
+    /// reading them.
+    fn skipping(&self) -> bool {
+        false
+    }
+}
+
+impl Sink for Vec<Tag> {
+    fn take(&mut self, t: Tag) {
+        self.push(t);
+    }
+}
+
+/// Parse ASCII DXF text into `sink`; the count of groups read (skipped ones included), which
+/// is held to `max_tags`.
+#[allow(clippy::while_let_loop)]
+fn parse_ascii_into(text: &str, max_tags: usize, sink: &mut impl Sink) -> Result<usize> {
+    let mut n = 0usize;
     let mut lines = text.lines().enumerate();
     loop {
         let Some((ln, code_line)) = lines.next() else { break };
@@ -273,23 +297,28 @@ fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
         }
         let code: i32 = ct.parse().map_err(|_| DxfError::BadCode { line: ln + 1, text: ct.chars().take(40).collect() })?;
         let Some((_, val)) = lines.next() else { return Err(DxfError::Eof) };
+        n += 1;
+        if n > max_tags {
+            return Err(DxfError::TooLarge { tags: n, limit: max_tags });
+        }
+        if code != 0 && sink.skipping() {
+            continue;
+        }
         // Unicode escapes are rare: only a string that has one is rebuilt.
         let v = match typed(code, val) {
             Value::Str(s) if s.contains("\\U+") || s.contains("\\M+") => Value::Str(unescape_unicode(&s)),
             o => o,
         };
-        tags.push(Tag { code, value: v });
-        if tags.len() > max_tags {
-            return Err(DxfError::TooLarge { tags: tags.len(), limit: max_tags });
-        }
-        if code == 0 && tags.last().is_some_and(|t| t.str() == "EOF") {
+        let eof = code == 0 && matches!(&v, Value::Str(s) if s == "EOF");
+        sink.take(Tag { code, value: v });
+        if eof {
             break;
         }
     }
-    if tags.is_empty() {
+    if n == 0 {
         return Err(DxfError::NotDxf);
     }
-    Ok(tags)
+    Ok(n)
 }
 
 struct Cur<'a> {
@@ -348,13 +377,53 @@ pub fn parse_binary(b: &[u8]) -> Result<Vec<Tag>> {
 }
 
 fn parse_binary_with_limit(b: &[u8], max_tags: usize) -> Result<Vec<Tag>> {
+    let mut tags = Vec::new();
+    parse_binary_into(b, max_tags, &mut tags)?;
+    Ok(tags)
+}
+
+/// Parse binary DXF (after its sentinel) into `sink`; the count of groups read, as
+/// [`parse_ascii_into`].
+fn parse_binary_into(b: &[u8], max_tags: usize, sink: &mut impl Sink) -> Result<usize> {
     let mut c = Cur { b, p: 0 };
     let mut text = codepage::BinaryText::default();
-    let mut tags = Vec::new();
+    let mut n = 0usize;
     while c.p < b.len() {
         let mut code = i32::from(c.i16()?);
         if code == 255 {
             code = i32::from(c.i16()?);
+        }
+        n += 1;
+        if n > max_tags {
+            return Err(DxfError::TooLarge { tags: n, limit: max_tags });
+        }
+        if code != 0 && sink.skipping() {
+            // Step over the value.
+            match kind_of(code) {
+                Kind::Str => {
+                    c.cstr()?;
+                }
+                Kind::Real => {
+                    c.f64()?;
+                }
+                Kind::Int16 => {
+                    c.i16()?;
+                }
+                Kind::Int32 => {
+                    c.i32()?;
+                }
+                Kind::Int64 => {
+                    c.i64()?;
+                }
+                Kind::Bool => {
+                    c.u8()?;
+                }
+                Kind::Hex => {
+                    let len = usize::from(c.u8()?);
+                    c.take(len)?;
+                }
+            }
+            continue;
         }
         let v = match kind_of(code) {
             Kind::Str => Value::Str(unescape_unicode(&text.string(code, c.cstr()?))),
@@ -364,9 +433,9 @@ fn parse_binary_with_limit(b: &[u8], max_tags: usize) -> Result<Vec<Tag>> {
             Kind::Int64 => Value::Int(c.i64()?),
             Kind::Bool => Value::Bool(c.u8()? != 0),
             Kind::Hex => {
-                let n = usize::from(c.u8()?);
-                let bytes = c.take(n)?;
-                let mut s = String::with_capacity(n * 2);
+                let len = usize::from(c.u8()?);
+                let bytes = c.take(len)?;
+                let mut s = String::with_capacity(len * 2);
                 for x in bytes {
                     let _ = write!(s, "{x:02X}");
                 }
@@ -374,18 +443,15 @@ fn parse_binary_with_limit(b: &[u8], max_tags: usize) -> Result<Vec<Tag>> {
             }
         };
         let eof = code == 0 && matches!(&v, Value::Str(s) if s == "EOF");
-        tags.push(Tag { code, value: v });
-        if tags.len() > max_tags {
-            return Err(DxfError::TooLarge { tags: tags.len(), limit: max_tags });
-        }
+        sink.take(Tag { code, value: v });
         if eof {
             break;
         }
     }
-    if tags.is_empty() {
+    if n == 0 {
         return Err(DxfError::NotDxf);
     }
-    Ok(tags)
+    Ok(n)
 }
 
 /// Format a real the way DXF writers usually do (shortest round-trip, with a decimal point).
@@ -583,6 +649,129 @@ pub fn into_sections(mut tags: Vec<Tag>) -> Vec<Section> {
     out
 }
 
+/// What [`parse_sections`] read.
+#[derive(Debug, Default)]
+pub struct Parsed {
+    pub sections: Vec<Section>,
+    /// Records (code-0 groups) outside any section: a damaged file.
+    pub outside: usize,
+    /// Records left out, by type in the order the types were first met, with how many of each.
+    pub skipped: Vec<(String, usize)>,
+}
+
+/// The sections as [`parse_sections`] builds them: each group goes into the section it belongs
+/// to as it is read, and the records whose type `skip` names are stepped over without a group
+/// being made for them.
+struct SectionSink<'a> {
+    sections: Vec<Section>,
+    /// The section being filled; none between sections.
+    open: Option<Section>,
+    /// The group after `0 SECTION` names the section.
+    naming: bool,
+    /// Inside a record that is left out.
+    skipping: bool,
+    outside: usize,
+    skip: &'a dyn Fn(&str) -> bool,
+    skipped: Vec<(String, usize)>,
+}
+
+impl<'a> SectionSink<'a> {
+    fn new(skip: &'a dyn Fn(&str) -> bool) -> Self {
+        SectionSink { sections: Vec::new(), open: None, naming: false, skipping: false, outside: 0, skip, skipped: Vec::new() }
+    }
+
+    fn finish(mut self) -> Parsed {
+        // A section the file never closes runs to its end, as in `into_sections`.
+        if let Some(s) = self.open.take() {
+            self.sections.push(s);
+        }
+        Parsed { sections: self.sections, outside: self.outside, skipped: self.skipped }
+    }
+}
+
+impl Sink for SectionSink<'_> {
+    fn skipping(&self) -> bool {
+        self.skipping
+    }
+
+    fn take(&mut self, t: Tag) {
+        if self.naming {
+            // The group after SECTION names the section when it is a 2; `into_sections` leaves
+            // it out either way.
+            self.naming = false;
+            if t.code == 2
+                && let Some(s) = &mut self.open
+            {
+                s.name = t.str();
+            }
+            return;
+        }
+        if t.code != 0 {
+            if !self.skipping
+                && let Some(s) = &mut self.open
+            {
+                s.tags.push(t);
+            }
+            return;
+        }
+        let kind = t.str();
+        match (kind.as_str(), &mut self.open) {
+            ("SECTION", None) => {
+                self.open = Some(Section::default());
+                self.naming = true;
+                self.skipping = false;
+            }
+            ("ENDSEC", open) => {
+                if let Some(s) = open.take() {
+                    self.sections.push(s);
+                }
+                self.skipping = false;
+            }
+            // A SECTION or EOF inside a section is one of its records, as in `into_sections`.
+            (_, Some(s)) => {
+                if (self.skip)(&kind) {
+                    self.skipping = true;
+                    match self.skipped.iter_mut().find(|(k, _)| *k == kind) {
+                        Some((_, n)) => *n = n.saturating_add(1),
+                        None => self.skipped.push((kind, 1)),
+                    }
+                } else {
+                    self.skipping = false;
+                    s.tags.push(t);
+                }
+            }
+            ("EOF", None) => {}
+            (_, None) => self.outside = self.outside.saturating_add(1),
+        }
+    }
+}
+
+/// Parse a DXF file (ASCII or binary) straight into its sections. Each group goes into the
+/// section it belongs to as it is read, so a large file's groups are held once (no tag list
+/// to split afterwards), and the records whose type `skip` names are stepped over without a
+/// group being made for them: a file with hundreds of thousands of objects the drawing never
+/// uses parses in a fraction of the memory and time. With a `skip` that names nothing, the
+/// sections are those of [`parse`] followed by [`into_sections`], and `outside` counts the
+/// records outside any section.
+pub fn parse_sections(bytes: &[u8], skip: &dyn Fn(&str) -> bool) -> Result<Parsed> {
+    parse_sections_with_limit(bytes, MAX_TAGS, skip)
+}
+
+/// [`parse_sections`] with an explicit group-code limit, which counts the groups skipped too.
+pub fn parse_sections_with_limit(bytes: &[u8], max_tags: usize, skip: &dyn Fn(&str) -> bool) -> Result<Parsed> {
+    let mut sink = SectionSink::new(skip);
+    if let Some(body) = bytes.strip_prefix(BINARY_SENTINEL) {
+        parse_binary_into(body, max_tags, &mut sink)?;
+    } else {
+        let tags = bytes.iter().filter(|&&b| b == b'\n').count().div_ceil(2);
+        if tags > max_tags {
+            return Err(DxfError::TooLarge { tags, limit: max_tags });
+        }
+        parse_ascii_into(&codepage::decode_ascii_file(bytes), max_tags, &mut sink)?;
+    }
+    Ok(sink.finish())
+}
+
 /// [`records`] without copying: (type, the tags after its code-0 tag) as slices of `tags`.
 pub fn record_slices(tags: &[Tag]) -> Vec<(String, &[Tag])> {
     let mut out: Vec<(String, &[Tag])> = Vec::new();
@@ -640,6 +829,49 @@ mod tests {
         assert_eq!(slices[0].0, "LINE");
         assert_eq!(slices[1].1.len(), 2);
         assert!(record_slices(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_sections_matches_parse_then_into_sections() {
+        let text = "999\ncomment\n0\nSECTION\n2\nHEADER\n9\n$X\n70\n1\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n1.5\n0\nCIRCLE\n8\nA\n40\n2\n0\nENDSEC\n0\nSTRAY\n5\n1\n0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n0\nENDSEC\n0\nEOF\n";
+        let tags = parse_ascii(text).unwrap();
+        let moved = into_sections(tags.clone());
+        let none = |_: &str| false;
+        for bytes in [text.as_bytes().to_vec(), write_binary(&tags, true)] {
+            let p = parse_sections(&bytes, &none).unwrap();
+            assert_eq!(p.sections.len(), moved.len());
+            for (a, b) in p.sections.iter().zip(&moved) {
+                assert_eq!(a.name, b.name);
+                assert_eq!(a.tags, b.tags);
+            }
+            assert_eq!((p.outside, p.skipped.len()), (1, 0));
+        }
+        // A file that never closes its last section keeps it, as `into_sections` does.
+        let open = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n";
+        let p = parse_sections(open.as_bytes(), &none).unwrap();
+        let m = into_sections(parse_ascii(open).unwrap());
+        assert_eq!(p.sections.len(), 1);
+        assert_eq!(p.sections[0].tags, m[0].tags);
+        assert!(parse_sections(b"", &none).is_err());
+        assert!(parse_sections(b"0\nSECTION\n2\nX\n0\n", &none).is_err());
+    }
+
+    #[test]
+    fn parse_sections_leaves_the_skipped_record_types_out_and_counts_them() {
+        let text = "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n3\nK\n350\nD\n0\nLSINTERNALCOMPONENT\n5\nD\n330\nC\n100\nAcDbLSInternalComponent\n40\n1.5\n310\nAB\n290\n1\n0\nXRECORD\n5\nE\n0\nLSINTERNALCOMPONENT\n5\nF\n0\nLSDEFINITION\n5\n10\n0\nENDSEC\n0\nEOF\n";
+        let skip = |k: &str| k.starts_with("LS");
+        let tags = parse_ascii(text).unwrap();
+        for bytes in [text.as_bytes().to_vec(), write_binary(&tags, true)] {
+            let p = parse_sections(&bytes, &skip).unwrap();
+            let kinds: Vec<String> = record_slices(&p.sections[0].tags).into_iter().map(|(k, _)| k).collect();
+            assert_eq!(kinds, ["DICTIONARY", "XRECORD"]);
+            assert_eq!(p.sections[0].tags.len(), 1 + 3 + 1 + 1);
+            assert_eq!(p.skipped, vec![("LSINTERNALCOMPONENT".to_string(), 2), ("LSDEFINITION".to_string(), 1)]);
+            // The limit counts the skipped groups too: the file is what it is.
+            let n = tags.len();
+            assert!(parse_sections_with_limit(&bytes, n - 1, &skip).is_err());
+            assert!(parse_sections_with_limit(&bytes, n, &skip).is_ok());
+        }
     }
 
     #[test]
