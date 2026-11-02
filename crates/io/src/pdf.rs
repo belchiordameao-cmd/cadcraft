@@ -1,8 +1,11 @@
 //! Vector PDF plotting (PLOT / EXPORTPDF): a minimal PDF writer of our own (pure Rust, no file
 //! access, so it runs on the web too).
 //!
-//! One page per sheet: model-space extents fitted to a sheet, or a layout at 1:1 (or the given
-//! `scale`) on its paper (paper units are millimetres in metric drawings, inches otherwise).
+//! One page per sheet: model-space extents fitted to a sheet, or a layout on its paper as its
+//! page setup says: the whole sheet at its plot scale (plot area `layout`, paper point (0, 0) at
+//! the printable area's corner, as in AutoCAD), or its paper-space extents scaled to fit or at
+//! the plot scale, centred or from the plot origin (`extents`). Paper units are millimetres in
+//! metric drawings, inches otherwise.
 //! Lines are stroked paths (`m`/`l`/`S`), fills are `f` paths, colours are RGB with colour 7 printing black on white
 //! paper, and line widths come from lineweights when enabled. The page setup's plot style
 //! table (or the `plotStyleTable` option) sets the printed colours, linetypes and lineweights.
@@ -315,19 +318,22 @@ pub fn page_for(d: &Drawing, space: &Space, o: &PdfOptions) -> Result<PageSetup>
     Ok(page)
 }
 
-/// World → paper-unit mapping: `p' = (p - from) * s + to`.
+/// World → page mapping: the paper point `(p - from) * s + to`, measured from the sheet's
+/// lower-left corner (`origin`, a margin below and left of the paper-space origin), in points.
 #[derive(Clone, Copy)]
 struct Map {
     from: Vec2,
     s: f64,
     to: Vec2,
+    /// The sheet's lower-left corner in paper units ([`Sheet::origin`]).
+    origin: Vec2,
     /// Points per paper unit.
     k: f64,
 }
 
 impl Map {
     fn pt(&self, p: Vec2) -> Vec2 {
-        ((p - self.from) * self.s + self.to) * self.k
+        ((p - self.from) * self.s + self.to - self.origin) * self.k
     }
 }
 
@@ -417,29 +423,41 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         cancel: None,
     };
     let k = unit_mm * PT_PER_MM;
-    let window = o.window.filter(|w| matches!(space, Space::Model) && !w.is_empty());
-    let fit = o.fit.unwrap_or(window.is_some() || matches!(space, Space::Model));
+    let model = matches!(space, Space::Model);
+    let window = o.window.filter(|w| model && !w.is_empty());
+    // Model space fits its extents (or the window) to the printable area. A layout plots as its
+    // page setup says: plot area `layout` (the default) is the whole sheet with paper point
+    // (0, 0) at the printable corner, at the plot scale; `extents` is the paper-space extents
+    // fitted to the printable area (or at the plot scale), centred when the setup says so.
+    // `display`, `limits` and `window`, whose frames are not kept, plot like `layout`.
+    let extents_area = !model && page.plot_area.eq_ignore_ascii_case("extents");
+    let fit = o.fit.unwrap_or(model || window.is_some() || (extents_area && page.scale_to_fit));
+    let scale = if model { o.scale } else { o.scale.or(Some(page.scale)) };
     // Chord tolerance: about 0.05 mm on paper.
-    let est = plot_scale(&window.unwrap_or_else(|| d.extents(space)), &sheet, fit, o.scale);
+    let est = plot_scale(&window.unwrap_or_else(|| d.extents(space)), &sheet, fit, scale);
     let tol = 0.05 / unit_mm / est.max(1e-300);
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
     let b = window.unwrap_or(list.bounds);
-    let s = plot_scale(&b, &sheet, fit, o.scale);
-    let map = if fit || matches!(space, Space::Model) {
+    let s = plot_scale(&b, &sheet, fit, scale);
+    let origin = sheet.origin;
+    let map = if model {
         let (from, to) = placement(space, &b, fit, &sheet, o);
-        Map { from, s, to, k }
+        Map { from, s, to, origin, k }
+    } else if extents_area {
+        let (from, to) = extents_placement(&b, page.center, &sheet);
+        Map { from, s, to, origin, k }
     } else {
-        Map { from: Vec2::ZERO, s, to: Vec2::ZERO, k }
+        Map { from: Vec2::ZERO, s, to: Vec2::ZERO, origin, k }
     };
     // Plot style ends, joins and fill patterns at the plot scale (a layout's are already drawn).
     let mut list = list;
     cadcraft_render::pen::apply(&mut list, map.s * unit_mm);
     let media = sheet.size * k;
-    let clip_pt = if fit || matches!(space, Space::Model) {
-        Bounds2::new(sheet.printable.min * k, sheet.printable.max * k)
+    let clip_pt = if model || extents_area {
+        Bounds2::new((sheet.printable.min - origin) * k, (sheet.printable.max - origin) * k)
     } else {
         Bounds2::new(Vec2::ZERO, media)
     };
@@ -455,6 +473,16 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     }
     let links = links(&list, &map, &clip_pt, links_to);
     Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+}
+
+/// Where a layout's paper-space extents `b` go when its page setup plots the extents: centred
+/// on the printable area, or from its lower-left corner (the plot origin). Returns the source
+/// and destination points.
+fn extents_placement(b: &Bounds2, center: bool, sheet: &Sheet) -> (Vec2, Vec2) {
+    if b.is_empty() {
+        return (Vec2::ZERO, sheet.printable.min);
+    }
+    if center { (b.center(), sheet.printable.center()) } else { (b.min, sheet.printable.min) }
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.

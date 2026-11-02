@@ -345,7 +345,8 @@ fn run_preview(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         (Vec2::ZERO, plot_scale(&b, &sheet, fit, scale), Vec2::ZERO)
     };
-    let world = Bounds2::new((Vec2::ZERO - to) / k + from, (sheet.size - to) / k + from);
+    // The image spans the sheet, whose corner sits a margin below and left of paper (0, 0).
+    let world = Bounds2::new((sheet.origin - to) / k + from, (sheet.origin + sheet.size - to) / k + from);
     if ![world.min.x, world.min.y, world.max.x, world.max.y].iter().all(|v| v.is_finite()) {
         return Err(bad("preview", "the drawing is too large to preview at this scale"));
     }

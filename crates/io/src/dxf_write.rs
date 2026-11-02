@@ -1461,8 +1461,8 @@ fn paper_views(d: &Drawing) -> HashMap<Handle, usize> {
 /// leaves it implicit again.
 fn paper_view(w: &mut W, d: &Drawing, e: &Entity, owner: &str, cx: &Ctx) {
     let Some(l) = cx.paper_views.get(&e.handle).and_then(|i| d.layouts.get(*i)) else { return };
-    let size = cadcraft_render::paper::sheet(d, &l.name).map(|s| s.size).unwrap_or(Vec2::new(12.0, 9.0));
-    let center = size * 0.5;
+    let (size, center) =
+        cadcraft_render::paper::sheet(d, &l.name).map(|s| (s.size, s.bounds().center())).unwrap_or((Vec2::new(12.0, 9.0), Vec2::new(6.0, 4.5)));
     let h = w.h();
     w.s(0, "VIEWPORT");
     w.s(5, h);

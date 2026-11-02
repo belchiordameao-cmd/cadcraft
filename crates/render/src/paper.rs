@@ -81,20 +81,26 @@ pub fn paper_unit_mm(d: &Drawing) -> f64 {
     if d.header.i64("MEASUREMENT", 0) == 1 { 1.0 } else { 25.4 }
 }
 
-/// The paper sheet of a layout, in paper-space units.
+/// The paper sheet of a layout, in paper-space units. As in AutoCAD, the paper-space origin is
+/// the lower-left corner of the printable area: the sheet itself starts a margin below and to
+/// the left of it (at [`Sheet::origin`]), and a plot of the layout puts paper point (0, 0) at the
+/// printable corner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sheet {
-    /// Sheet size (already rotated for landscape). The sheet spans `(0,0)..size`.
+    /// Sheet size (already rotated for landscape). The sheet spans `origin..origin + size`.
     pub size: Vec2,
-    /// Printable area (inside the margins).
+    /// The sheet's lower-left corner: `(-left margin, -bottom margin)`.
+    pub origin: Vec2,
+    /// Printable area (inside the margins): `(0, 0)..(size - margins)`.
     pub printable: Bounds2,
     /// Millimetres per paper-space unit.
     pub unit_mm: f64,
 }
 
 impl Sheet {
+    /// The sheet: `origin..origin + size`.
     pub fn bounds(&self) -> Bounds2 {
-        Bounds2::new(Vec2::ZERO, self.size)
+        Bounds2::new(self.origin, self.origin + self.size)
     }
     /// The sheet for a page setup in a drawing whose paper units are `unit_mm` millimetres.
     pub fn from_page(page: &PageSetup, unit_mm: f64) -> Sheet {
@@ -107,12 +113,12 @@ impl Sheet {
         let m = |i: usize| page.margins_mm.get(i).copied().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0) / u;
         // Margins: left, bottom, right, top (DXF group codes 40..43).
         let (l, b, r, t) = (m(0), m(1), m(2), m(3));
-        let printable = if l + r < size.x && b + t < size.y {
-            Bounds2::new(Vec2::new(l, b), Vec2::new(size.x - r, size.y - t))
+        let (origin, printable) = if l + r < size.x && b + t < size.y {
+            (Vec2::new(-l, -b), Bounds2::new(Vec2::ZERO, Vec2::new(size.x - l - r, size.y - b - t)))
         } else {
-            Bounds2::new(Vec2::ZERO, size)
+            (Vec2::ZERO, Bounds2::new(Vec2::ZERO, size))
         };
-        Sheet { size, printable, unit_mm: u }
+        Sheet { size, origin, printable, unit_mm: u }
     }
 }
 
@@ -136,7 +142,10 @@ mod tests {
         let page = PageSetup { width_mm: 210.0, height_mm: 297.0, margins_mm: [5.0; 4], landscape: true, ..PageSetup::default() };
         let s = Sheet::from_page(&page, 1.0);
         assert_eq!(s.size, Vec2::new(297.0, 210.0));
-        assert_eq!(s.printable, Bounds2::new(Vec2::new(5.0, 5.0), Vec2::new(292.0, 205.0)));
+        // The printable area starts at the origin; the sheet's corner is a margin below and left of it.
+        assert_eq!(s.printable, Bounds2::new(Vec2::ZERO, Vec2::new(287.0, 200.0)));
+        assert_eq!(s.origin, Vec2::new(-5.0, -5.0));
+        assert_eq!(s.bounds(), Bounds2::new(Vec2::new(-5.0, -5.0), Vec2::new(292.0, 205.0)));
         let hostile = PageSetup { width_mm: f64::NAN, height_mm: -1.0, margins_mm: [1e9; 4], ..PageSetup::default() };
         let s = Sheet::from_page(&hostile, 0.0);
         assert!(s.size.x > 0.0 && s.printable == s.bounds());

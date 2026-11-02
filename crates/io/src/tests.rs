@@ -512,8 +512,9 @@ fn pdf_layout_one_to_one_with_viewport() {
     let content = check_pdf(&bytes);
     // ANSI A landscape (inches → points).
     assert_eq!(media_box(&bytes), (792.0, 612.0));
-    // Viewport border at 1:1: x from 1in to 9in = 72pt..648pt.
-    assert!(content.contains("72 72 m") || content.contains("72 72 l"), "{content}");
+    // Viewport border at 1:1: paper (1 in, 1 in) lies 1 in from the printable corner, which sits
+    // 0.25 in from the sheet's edge: 90 pt from the page corner.
+    assert!(content.contains("90 90 m") || content.contains("90 90 l"), "{content}");
     // Lineweights on: default 0.25 mm = 0.709 pt.
     assert!(content.contains("0.709 w"));
     let off = plot(&d, &paper, &serde_json::json!({"lineweights": false})).unwrap();
@@ -2407,4 +2408,67 @@ fn foreign_table_reads_cell_text_height_and_keeps_style_scale() {
     let t2 = first(&back, |k| if let EntityKind::Table(x) = k { Some(x.clone()) } else { None });
     assert_eq!(t2.cells[0][0].text_height, Some(150.0));
     assert_eq!(t2.cells[0][1].text_height, None);
+}
+
+/// The `x y m` / `x y l` path points of an uncompressed PDF content stream.
+fn path_points(content: &str) -> Vec<Vec2> {
+    let toks: Vec<&str> = content.split_whitespace().collect();
+    toks.windows(3).filter(|w| w[2] == "m" || w[2] == "l").filter_map(|w| Some(Vec2::new(w[0].parse().ok()?, w[1].parse().ok()?))).collect()
+}
+
+#[test]
+fn pdf_layout_plot_area_extents_fits_and_centres_the_sheet_contents() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "extents".into();
+        p.scale_to_fit = true;
+        p.center = true;
+    }
+    // A frame larger than the paper: 320 x 230 from (-10, -10).
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(-10.0, -10.0), Vec2::new(310.0, -10.0), Vec2::new(310.0, 220.0), Vec2::new(-10.0, 220.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    let k = 72.0 / 25.4;
+    let extent = |content: &str| {
+        let pts = path_points(content);
+        assert!(pts.len() >= 4, "{content}");
+        pts.iter().fold(Bounds2::EMPTY, |mut b, p| {
+            b.add(*p);
+            b
+        })
+    };
+    // Scaled to fit and centred: scale 200/230 (the printable area is 287 x 200), centred on it.
+    let bytes = plot(&d, &paper, &serde_json::json!({})).unwrap();
+    let (w, h) = media_box(&bytes);
+    assert!((w - 297.0 * k).abs() < 0.01 && (h - 210.0 * k).abs() < 0.01, "A4 landscape: {w} x {h}");
+    let b = extent(&check_pdf(&bytes));
+    let s = 200.0 / 230.0;
+    let (cx, cy) = ((5.0 + 143.5) * k, (5.0 + 100.0) * k);
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+    assert!(near(b.min.x, cx - 160.0 * s * k) && near(b.max.x, cx + 160.0 * s * k), "{b:?}");
+    assert!(near(b.min.y, cy - 115.0 * s * k) && near(b.max.y, cy + 115.0 * s * k), "{b:?}");
+    // At the plot scale (1:1) from the plot origin instead: the frame's corner (-10, -10) lands
+    // at the printable corner (5 mm from the sheet's) and the frame overflows the sheet.
+    d.layouts[0].page.scale_to_fit = false;
+    d.layouts[0].page.center = false;
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!(near(b.min.x, 5.0 * k) && near(b.min.y, 5.0 * k) && near(b.max.x, 325.0 * k) && near(b.max.y, 235.0 * k), "{b:?}");
+    // Plot area `layout`: paper (0, 0) at the printable corner, so the frame starts 5 mm outside it.
+    d.layouts[0].page.plot_area = "layout".into();
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!(near(b.min.x, -5.0 * k) && near(b.min.y, -5.0 * k) && near(b.max.x, 315.0 * k) && near(b.max.y, 225.0 * k), "{b:?}");
 }
