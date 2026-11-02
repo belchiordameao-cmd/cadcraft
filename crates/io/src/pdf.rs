@@ -656,22 +656,119 @@ pub(crate) fn plot_scale(b: &Bounds2, sheet: &Sheet, fit: bool, scale: Option<f6
     if s.is_finite() && s > 0.0 { s } else { 1.0 }
 }
 
-/// A number for a content stream: short, finite, no exponent.
+/// A number for a content stream: short, finite, no exponent (three decimals, trailing zeros
+/// dropped). Written digit by digit: a plot writes millions of them, and formatting each one
+/// through `format!` took a third of a large page's time.
 fn num(out: &mut String, v: f64) {
     let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
-    let mut s = format!("{v:.3}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
+    // Thousandths, rounded half to even like `{:.3}`.
+    let scaled = v.abs() * 1000.0;
+    let floor = scaled.floor();
+    let rest = scaled - floor;
+    let rounded = if rest > 0.5 || (rest == 0.5 && floor % 2.0 == 1.0) { floor + 1.0 } else { floor };
+    let thousandths = rounded as u64;
+    if thousandths == 0 {
+        out.push('0');
+        return;
+    }
+    if v < 0.0 {
+        out.push('-');
+    }
+    let (int, frac) = (thousandths / 1000, thousandths % 1000);
+    let mut digits = [0u8; 20];
+    let mut n = digits.len();
+    let mut i = int;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + (i % 10) as u8;
+        i /= 10;
+        if i == 0 {
+            break;
         }
     }
-    if s == "-0" {
-        s = "0".into();
+    out.push_str(std::str::from_utf8(digits.get(n..).unwrap_or(b"0")).unwrap_or("0"));
+    if frac != 0 {
+        let f = [b'0' + (frac / 100) as u8, b'0' + ((frac / 10) % 10) as u8, b'0' + (frac % 10) as u8];
+        let keep = if f[2] != b'0' {
+            3
+        } else if f[1] != b'0' {
+            2
+        } else {
+            1
+        };
+        out.push('.');
+        out.push_str(std::str::from_utf8(f.get(..keep).unwrap_or(b"")).unwrap_or(""));
     }
-    out.push_str(&s);
+}
+
+#[cfg(test)]
+mod num_tests {
+    use super::num;
+
+    /// What `num` wrote before, through `format!`.
+    fn reference(v: f64) -> String {
+        let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
+        let mut s = format!("{v:.3}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        if s == "-0" {
+            s = "0".into();
+        }
+        s
+    }
+
+    #[test]
+    fn numbers_are_written_as_format_wrote_them() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            0.0005,
+            0.0625,
+            -0.0625,
+            1.0005,
+            72.0,
+            90.0,
+            0.709,
+            841.89,
+            595.276,
+            1e7,
+            -1e7,
+            2e9,
+            f64::NAN,
+            f64::INFINITY,
+            0.001,
+            0.0004,
+            0.9995,
+            999.9995,
+            123456.789,
+        ];
+        let mut x = 0.37_f64;
+        for _ in 0..20_000 {
+            x = (x * 7919.0 + 0.123).rem_euclid(20_000.0) - 10_000.0;
+            values.push(x);
+            values.push(x / 1000.0);
+        }
+        for v in values {
+            let mut s = String::new();
+            num(&mut s, v);
+            let r = reference(v);
+            if s != r {
+                // Only the multiplication's last-bit rounding may differ from an exact decimal
+                // expansion, and then by one thousandth.
+                let (a, b): (f64, f64) = (s.parse().unwrap(), r.parse().unwrap());
+                assert!((a - b).abs() <= 0.0011, "{v}: {s} vs {r}");
+            }
+        }
+    }
 }
 
 fn pt(out: &mut String, p: Vec2) {
