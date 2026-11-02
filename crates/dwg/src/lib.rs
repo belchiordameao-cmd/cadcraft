@@ -56,10 +56,40 @@ pub struct DwgProbe {
     pub table_records: usize,
     pub recovered_errors: usize,
     pub diagnostics: usize,
+    /// DGN line-style objects left out before the DXF text was written, by type (none when
+    /// the file has at most [`MAX_DGN_LINE_STYLE_OBJECTS`]).
+    pub dgn_line_styles_left_out: Vec<(String, usize)>,
 }
 
 /// A byte count in megabytes for messages ("9.9 MB", "1024 MB").
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+/// Most DGN line-style objects kept from one file. `AcDbLS*` objects are the definitions and
+/// components of linetypes imported from DGN: an import leaves hundreds of thousands in a file,
+/// each a tree of a hundred groups, that nothing draws. A file with more than this opens without
+/// them, with a note ([`dgn_line_style_note`]); a file saved from it has no DGN line styles (the
+/// linetypes stay).
+pub const MAX_DGN_LINE_STYLE_OBJECTS: usize = 10_000;
+
+/// Whether a DXF record type is a DGN line-style object.
+pub fn is_dgn_line_style(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_uppercase().as_str(),
+        "LSDEFINITION" | "LSCOMPOUNDCOMPONENT" | "LSINTERNALCOMPONENT" | "LSPOINTCOMPONENT" | "LSSTROKEPATTERNCOMPONENT" | "LSSYMBOLCOMPONENT"
+    )
+}
+
+/// The note on the DGN line-style objects a file had more than [`MAX_DGN_LINE_STYLE_OBJECTS`]
+/// of, `counts` being how many of each type were left out.
+pub fn dgn_line_style_note(counts: &[(String, usize)]) -> String {
+    let n: usize = counts.iter().map(|(_, c)| c).sum();
+    let types: Vec<String> = counts.iter().map(|(k, c)| format!("{c} {k}")).collect();
+    format!(
+        "{n} DGN line-style objects were left out ({}): a drawing keeps at most {MAX_DGN_LINE_STYLE_OBJECTS}. \
+         The drawing opens and plots without them; a file saved from it has no DGN line styles (their linetypes stay).",
+        types.join(", ")
+    )
+}
+
 fn mb(n: u64) -> String {
     let m = n as f64 / f64::from(1u32 << 20);
     if m >= 100.0 { format!("{m:.0} MB") } else { format!("{m:.1} MB") }
@@ -70,7 +100,7 @@ mod native {
     use std::io::{Cursor, Write};
     use std::panic::AssertUnwindSafe;
 
-    use super::{DwgProbe, Limits, mb};
+    use super::{DwgProbe, Limits, MAX_DGN_LINE_STYLE_OBJECTS, dgn_line_style_note, is_dgn_line_style, mb};
 
     /// Read DWG bytes and return an ASCII DXF rendition, within [`Limits::DEFAULT`].
     pub fn dwg_to_dxf(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -123,10 +153,15 @@ mod native {
             probe.recovered_errors = st.recovered_errors;
             probe.diagnostics = st.diagnostics.len();
         }
-        let notes = read_notes(&outcome.stats);
+        let mut notes = read_notes(&outcome.stats);
         let mut doc = outcome.document;
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
+        let left_out = drop_dgn_line_styles(&mut doc);
+        if !left_out.is_empty() {
+            notes.push(dgn_line_style_note(&left_out));
+        }
+        probe.dgn_line_styles_left_out = left_out;
         let t = Instant::now();
         let mut out = CappedWriter { buf: Vec::new(), limit: limits.max_dxf_bytes, exceeded: false };
         let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
@@ -308,6 +343,39 @@ mod native {
                 }
             }
         }
+    }
+
+    /// Leave the DGN line-style objects out of the DXF text when the file has more than
+    /// [`MAX_DGN_LINE_STYLE_OBJECTS`] (see there): a DGN import leaves hundreds of thousands,
+    /// each a tree of a hundred groups that nothing draws, and converting and reading them
+    /// took most of the time and memory of opening such a file. Returns the counts by type of
+    /// what was left out (nothing when they are kept). acadrust's dictionary writer leaves out
+    /// the entries of objects that are gone, so the dictionary that listed them is written
+    /// without them.
+    fn drop_dgn_line_styles(doc: &mut acadrust::CadDocument) -> Vec<(String, usize)> {
+        use acadrust::objects::ObjectType;
+        let name_of = |o: &ObjectType| -> Option<String> {
+            match o {
+                ObjectType::DgnLineStyle(d) => Some(d.dxf_name().to_string()),
+                ObjectType::Unknown { type_name, .. } if is_dgn_line_style(type_name) => Some(type_name.trim().to_ascii_uppercase()),
+                _ => None,
+            }
+        };
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for name in doc.objects.values().filter_map(name_of) {
+            match counts.iter_mut().find(|(k, _)| *k == name) {
+                Some((_, n)) => *n = n.saturating_add(1),
+                None => counts.push((name, 1)),
+            }
+        }
+        if counts.iter().map(|(_, n)| n).sum::<usize>() <= MAX_DGN_LINE_STYLE_OBJECTS {
+            return Vec::new();
+        }
+        doc.objects.retain(|_, o| name_of(o).is_none());
+        doc.dgn_ls_definitions.clear();
+        doc.dgn_ls_components.clear();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts
     }
 
     /// Leave out what acadrust can't write as this DWG version: other programs' custom entities
