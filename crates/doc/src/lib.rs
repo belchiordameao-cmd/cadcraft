@@ -26,7 +26,7 @@ pub use cadcraft_color as color;
 pub use cadcraft_geom as geom;
 pub use constraint::*;
 pub use entity::*;
-pub use extents::{MAX_BLOCK_DEPTH, entity_bounds};
+pub use extents::{MAX_BLOCK_DEPTH, entity_bounds, entity_bounds_with};
 pub use gdt::*;
 pub use header::{HVal, Header};
 pub use plotstyle::*;
@@ -353,9 +353,14 @@ impl Drawing {
     pub fn extents(&self, space: &Space) -> cadcraft_geom::Bounds2 {
         let mut b = cadcraft_geom::Bounds2::EMPTY;
         if let Some(store) = self.space(space) {
+            // Layer visibility from a table built once: a drawing with bound xrefs has thousands
+            // of layers, and the entities are many more.
+            let hidden: std::collections::HashSet<String> =
+                self.layers.iter().filter(|l| !l.visible()).map(|l| l.name.to_ascii_uppercase()).collect();
+            let visible = |name: &str| hidden.is_empty() || !hidden.contains(&name.to_ascii_uppercase());
             for e in store.iter() {
-                if self.is_visible(e) {
-                    b = b.union(&entity_bounds(self, e, 0));
+                if e.common.visible && visible(&e.common.layer) && !self.is_hidden_object(e.handle) {
+                    b = b.union(&entity_bounds_with(self, e, 0, &visible));
                 }
             }
         }

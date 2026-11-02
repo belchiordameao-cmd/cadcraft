@@ -69,6 +69,8 @@ const USAGE: &str = "usage:
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT [--lazy] [--launch]]
   cadcraft-cli perf [N | FILE]
+  cadcraft-cli perf FILE --open    time the phases of opening FILE (DWG -> DXF text -> groups -> document),
+                           with the memory each one takes and the file's records by type
   cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version
 
@@ -174,7 +176,7 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
-        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
     });
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
@@ -216,6 +218,7 @@ fn validate_options(command: &str, args: &[String], specs: &[OptionSpec]) -> Res
 }
 
 const NO_OPTIONS: &[OptionSpec] = &[];
+const PERF_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--open", takes_value: false }];
 const INFO_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--layouts", takes_value: false }];
 
 /// `info FILE --layouts`: per-layout page setup and viewport fields, for diagnosing a sheet
@@ -385,6 +388,7 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) ->
     {
         let r = s.execute("exportpdf", &with_fit(json!({ "path": out, "layout": one }))).map_err(|e| e.to_string())?;
         eprintln!("wrote {out} ({} bytes, layout {one})", r["bytes"].as_u64().unwrap_or(0));
+        print_warnings(&r);
         return Ok(());
     }
     if layouts.len() > 1 && layouts.iter().any(|l| group(l)) {
@@ -408,8 +412,16 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) ->
             sheet["bytes"].as_u64().unwrap_or(0),
             sheet["layout"].as_str().unwrap_or("?")
         );
+        print_warnings(sheet);
     }
     Ok(())
+}
+
+/// The plot's warnings (a page that comes out blank, and what was done about it) on stderr.
+fn print_warnings(r: &Value) {
+    for w in r["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        eprintln!("warning: {w}");
+    }
 }
 
 /// The warning for the records of `path` the reader could not place, or `None` when there are none.
@@ -546,6 +558,130 @@ fn synthetic(n: usize, side: f64) -> Result<cadcraft_engine::doc::Drawing, Strin
     Ok(dr)
 }
 
+/// Resident and peak memory of this process, for `perf --open` (Linux; empty elsewhere).
+fn mem_line() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let kb = |key: &str| {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0)
+                / 1024
+        };
+        format!("memory {} MB (peak {} MB)", kb("VmRSS"), kb("VmHWM"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        String::new()
+    }
+}
+
+/// `perf FILE --open`: what each phase of opening the file costs, for a file that opens slowly
+/// or needs too much memory: the DWG read and its DXF rendition (acadrust), the groups, the
+/// sections, the records by type (count, groups, text, the largest record) and the document.
+/// The text is parsed once: the document is built from the sections the report looked at.
+fn perf_open(path: &str) -> Result<(), String> {
+    use cadcraft_dxf::Value as V;
+    use std::collections::HashMap;
+    use std::time::Instant;
+    let mb = |n: usize| n as f64 / 1048576.0;
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    outln!("{path}: {:.1} MB; {}", mb(bytes.len()), mem_line());
+    let t0 = Instant::now();
+    let dxf = if cadcraft_dwg::is_dwg(&bytes) {
+        let (dxf, notes, p) = cadcraft_dwg::dwg_to_dxf_probed(&bytes, cadcraft_dwg::Limits::DEFAULT)?;
+        outln!(
+            "dwg read (acadrust): {:.1} s; {} source records ({} decoded, {} skipped); {} entities, {} objects, {} table records; {} recovered errors, {} diagnostics",
+            p.read_secs,
+            p.source_records,
+            p.decoded_records,
+            p.skipped_records,
+            p.entities,
+            p.objects,
+            p.table_records,
+            p.recovered_errors,
+            p.diagnostics
+        );
+        outln!(
+            "dwg -> dxf text: {:.1} s; {:.1} MB ({:.1} x the DWG); header variables {:.2} s; {}",
+            p.write_secs,
+            mb(dxf.len()),
+            dxf.len() as f64 / bytes.len().max(1) as f64,
+            p.header_secs,
+            mem_line()
+        );
+        for n in &notes {
+            outln!("  note: {n}");
+        }
+        drop(bytes);
+        dxf
+    } else {
+        bytes
+    };
+    let t = Instant::now();
+    let (secs, outside) = cadcraft_io::dxf_sections(&dxf).map_err(|e| e.to_string())?;
+    let tags: usize = secs.iter().map(|s| s.tags.len()).sum();
+    outln!(
+        "dxf groups: {:.1} s; {} groups in {} sections ({:.0} MB as groups, plus their text), {} outside any section; {}",
+        t.elapsed().as_secs_f64(),
+        tags,
+        secs.len(),
+        mb(tags * std::mem::size_of::<cadcraft_dxf::Tag>()),
+        outside,
+        mem_line()
+    );
+    drop(dxf);
+    outln!("after dropping the text: {}", mem_line());
+    for s in &secs {
+        outln!("  section {:<10} {:>12} groups", s.name, s.tags.len());
+    }
+    // Records by type: count, groups, text bytes, the largest record.
+    let mut by_type: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    let (mut layers, mut blocks) = (0usize, 0usize);
+    for s in &secs {
+        for (kind, rec) in cadcraft_dxf::record_slices(&s.tags) {
+            let text: usize = rec
+                .iter()
+                .map(|t| match &t.value {
+                    V::Str(x) | V::Hex(x) => x.len(),
+                    _ => 0,
+                })
+                .sum();
+            let e = by_type.entry(format!("{}/{kind}", s.name)).or_default();
+            e.0 += 1;
+            e.1 += rec.len();
+            e.2 += text;
+            e.3 = e.3.max(rec.len());
+            match (s.name.as_str(), kind.as_str()) {
+                ("TABLES", "LAYER") => layers += 1,
+                ("BLOCKS", "BLOCK") => blocks += 1,
+                _ => {}
+            }
+        }
+    }
+    let mut rows: Vec<(&String, &(usize, usize, usize, usize))> = by_type.iter().collect();
+    rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+    outln!("records by type (the 20 with most groups; {layers} layers, {blocks} blocks):");
+    outln!("  {:<32} {:>10} {:>12} {:>9} {:>10}", "section/type", "records", "groups", "text MB", "largest");
+    for (k, (count, groups, text, largest)) in rows.iter().take(20) {
+        outln!("  {k:<32} {count:>10} {groups:>12} {:>9.1} {largest:>10}", mb(*text));
+    }
+    let t = Instant::now();
+    let d = cadcraft_io::read_dxf_sections(secs, outside).map_err(|e| e.to_string())?;
+    outln!(
+        "document: {:.1} s; {} entities, {} blocks, {} layers, {} layouts; {}",
+        t.elapsed().as_secs_f64(),
+        d.entity_count(),
+        d.blocks.len(),
+        d.layers.len(),
+        d.layouts.len(),
+        mem_line()
+    );
+    outln!("total: {:.1} s", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// `perf FILE`: the display list built as the canvas builds it (a 1600 x 1000 px view at the
 /// drawing's centre: tolerance, dash level of detail and view window from the zoom band), at
 /// zoom extents and zoomed in 4x at a time, next to the full-detail build plots use.
@@ -592,6 +728,10 @@ fn perf(args: &[String]) -> Result<(), String> {
     use cadcraft_engine::geom::{Bounds2, Vec2};
     use cadcraft_engine::{select, snap};
     use std::time::Instant;
+    if args.iter().any(|a| a == "--open") {
+        let path = args.iter().find(|a| !a.starts_with("--")).ok_or("perf --open needs a file")?;
+        return perf_open(path);
+    }
     if let Some(path) = args.first().filter(|a| a.parse::<usize>().is_err()) {
         return perf_file(path);
     }
@@ -784,7 +924,7 @@ fn cli() -> ExitCode {
             .and_then(|p| info(p, rest.iter().any(|a| a == "--layouts"))),
         Some("convert") => convert(&rest),
         Some("run") => run(&rest),
-        Some("perf") => validate_options("perf", &rest, NO_OPTIONS).and_then(|_| perf(&rest)),
+        Some("perf") => validate_options("perf", &rest, PERF_OPTIONS).and_then(|_| perf(&rest)),
         Some("sample") => validate_options("sample", &rest, NO_OPTIONS).and_then(|_| sample(&rest)),
         Some("commands") => validate_options("commands", &rest, NO_OPTIONS).map(|_| {
             let s = Session::new();
@@ -1091,6 +1231,58 @@ mod tests {
         };
         assert_eq!(media(&x), media(&w), "the DWG plots on the layout's page");
         assert!(w.len() > x.len() / 2 && w.len() < x.len() * 2, "dxf {} bytes, dwg {} bytes", x.len(), w.len());
+    }
+
+    #[test]
+    fn exportpdf_warns_when_the_window_lies_outside_the_drawing() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let mut drawing = cadcraft_engine::doc::Drawing::new_metric();
+        let name = drawing.layouts[0].name.clone();
+        {
+            let p = &mut drawing.layouts[0].page;
+            p.plot_area = "window".into();
+            p.window = Some(Bounds2::new(Vec2::new(1000.0, 1000.0), Vec2::new(1100.0, 1050.0)));
+            p.scale_to_fit = true;
+        }
+        let line = cadcraft_engine::doc::Line {
+            a: cadcraft_engine::geom::Vec3::new(10.0, 10.0, 0.0),
+            b: cadcraft_engine::geom::Vec3::new(200.0, 150.0, 0.0),
+        };
+        drawing.add(&Space::Paper(name.clone()), cadcraft_engine::doc::Common::default(), cadcraft_engine::doc::EntityKind::Line(line)).unwrap();
+        std::fs::write(path("w.dxf"), cadcraft_io::write_dxf(&drawing)).unwrap();
+        let mut s = Session::empty();
+        open(&mut s, &path("w.dxf")).unwrap();
+        let r = s.execute("exportpdf", &json!({ "path": path("w.pdf"), "layout": name })).unwrap();
+        let warning = r["warnings"][0].as_str().unwrap_or("").to_string();
+        assert!(warning.contains("window") && warning.contains("blank"), "{r}");
+        let r = s.execute("exportpdf", &json!({ "path": path("f.pdf"), "layout": name, "fit": true })).unwrap();
+        assert!(r["warnings"][0].as_str().unwrap_or("").contains("extents were plotted instead"), "{r}");
+        // The CLI path prints them and still writes the file.
+        convert(&a_(&[&path("w.dxf"), &path("c.pdf"), "--layout", &name, "--fit"])).unwrap();
+        assert!(std::fs::read(path("c.pdf")).unwrap().starts_with(b"%PDF"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn a_(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn perf_open_reports_the_phases_of_a_file() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-perfopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.dxf").to_string_lossy().to_string();
+        run(&a_(&["--sample", "--save", &f])).unwrap();
+        perf_open(&f).unwrap();
+        let g = dir.join("p.dwg").to_string_lossy().to_string();
+        convert(&a_(&[&f, &g])).unwrap();
+        perf_open(&g).unwrap();
+        assert!(perf_open(&dir.join("nope.dwg").to_string_lossy()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn args(values: &[&str]) -> Vec<String> {

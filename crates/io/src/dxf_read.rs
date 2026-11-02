@@ -1653,10 +1653,20 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
+    let (secs, outside) = sections_of(bytes)?;
+    read_sections(secs, outside)
+}
+
+/// The sections of a DXF file's groups (the tags move into them: a large file's groups are held
+/// once) and the count of groups outside any section.
+pub fn sections_of(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
     let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
     let outside = outside_sections(&tags);
-    // The tags move into their sections: a large file's groups are held once.
-    let secs = cadcraft_dxf::into_sections(tags);
+    Ok((cadcraft_dxf::into_sections(tags), outside))
+}
+
+/// [`read`] from a file's sections ([`sections_of`]).
+pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
@@ -1770,12 +1780,20 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         paper_block_for.insert("*PAPER_SPACE".into(), "Layout1".into());
     }
     let first_layout = d.layouts.first().map(|l| l.name.clone()).unwrap_or_else(|| "Layout1".into());
+    // Layers the entities name, made once each: a drawing with bound xrefs has thousands of
+    // layers, and `Drawing::ensure_layer` scans the table for every entity.
+    let mut known: std::collections::HashSet<String> = d.layers.iter().map(|l| l.name.to_ascii_uppercase()).collect();
+    let mut ensure = |d: &mut Drawing, name: &str| {
+        if known.insert(name.to_ascii_uppercase()) {
+            d.layers.push(Layer::new(name));
+        }
+    };
     // Blocks: model/paper space blocks hold entities in newer files.
     for (name, base, description, ents, xref) in blocks {
         let up = name.to_ascii_uppercase();
         if up == "*MODEL_SPACE" {
             for (_, _, e) in ents {
-                d.ensure_layer(&e.common.layer);
+                ensure(&mut d, &e.common.layer);
                 d.model.push(e);
             }
             continue;
@@ -1818,7 +1836,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     }
     // ENTITIES section: model space, or paper space when flagged (67=1).
     for (owner, paper, e) in entities {
-        d.ensure_layer(&e.common.layer);
+        ensure(&mut d, &e.common.layer);
         let owner_name = owner.and_then(|o| rx.brs.get(&o.trim().to_ascii_uppercase()).cloned()).map(|n| n.to_ascii_uppercase());
         let to_paper = paper || owner_name.as_deref().is_some_and(|n| n.starts_with("*PAPER_SPACE"));
         if to_paper {

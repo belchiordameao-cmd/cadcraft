@@ -207,6 +207,11 @@ fn window(v: Option<&Value>) -> Option<Bounds2> {
 
 /// Plot with JSON options (the engine's `plot` hook).
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
+    plot_with_warnings(d, space, opts).map(|(bytes, _)| bytes)
+}
+
+/// [`plot`], also returning the warnings of the plot (see [`pdf_sheets_with_warnings`]).
+pub fn plot_with_warnings(d: &Drawing, space: &Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>)> {
     validate_plot_offset_json(opts)?;
     // `layouts: [name | "Model"] | "all"` plots those sheets into one file, one page each,
     // instead of `space`; "all" = Model if it has objects, then the layouts in tab order.
@@ -233,7 +238,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
-        return pdf_items(d, &items, &o);
+        return pdf_items_with_warnings(d, &items, &o);
     }
     match opts.get("layouts") {
         Some(Value::String(a)) if a.eq_ignore_ascii_case("all") => {
@@ -241,7 +246,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
             layouts.sort_by_key(|l| l.tab_order);
             let model = (!d.model.is_empty()).then_some(Space::Model);
             let spaces: Vec<Space> = model.into_iter().chain(layouts.iter().map(|l| Space::Paper(l.name.clone()))).collect();
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_warnings(d, &spaces, &o)
         }
         Some(v) => {
             let names = v.as_array().ok_or_else(|| IoError::Format("`layouts` must be a list of layout names".into()))?;
@@ -256,9 +261,9 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                     None => Err(IoError::Format("`layouts` must be a list of layout names".into())),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_warnings(d, &spaces, &o)
         }
-        None => pdf(d, space, &o),
+        None => pdf_sheets_with_warnings(d, std::slice::from_ref(space), &o),
     }
 }
 
@@ -350,14 +355,25 @@ fn sheet_name(space: &Space) -> String {
 /// Write a vector PDF with one page per space (at most [`MAX_PAGES`]), each labelled with its
 /// layout name. The options apply to every sheet; layouts use their own page setups.
 pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_sheets_with_warnings(d, spaces, o).map(|(bytes, _)| bytes)
+}
+
+/// [`pdf_sheets`], also returning the warnings of the plot: a page that comes out blank because
+/// its page setup's window or its objects lie elsewhere, and what was done about it.
+pub fn pdf_sheets_with_warnings(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<(Vec<u8>, Vec<String>)> {
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), o.clone())).collect();
-    pdf_items(d, &items, o)
+    pdf_items_with_warnings(d, &items, o)
 }
 
 /// Write a vector PDF with one page per `(space, options)` item (at most [`MAX_PAGES`]): each
 /// page plots with its own options (window, paper, orientation); `o` supplies the file-wide
 /// ones (compression, title, layers, links).
 pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_items_with_warnings(d, items, o).map(|(bytes, _)| bytes)
+}
+
+/// [`pdf_items`], also returning the warnings of the plot (see [`pdf_sheets_with_warnings`]).
+pub fn pdf_items_with_warnings(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<(Vec<u8>, Vec<String>)> {
     if items.iter().any(|(_, io)| io.offset.is_some_and(|offset| !valid_plot_offset(offset))) {
         return Err(IoError::Format("plot offset must contain two finite values within ±100000 mm".into()));
     }
@@ -380,10 +396,16 @@ pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> 
         d
     };
     let links = all_links(d, o);
-    let pages = items.iter().map(|(s, po)| sheet(drawn, s, po, &links)).collect::<Result<Vec<_>>>()?;
+    let mut warnings = Vec::new();
+    let mut pages = Vec::with_capacity(items.len());
+    for (s, po) in items {
+        let (page, w) = sheet(drawn, s, po, &links)?;
+        pages.push(page);
+        warnings.extend(w);
+    }
     let title = if o.title.is_empty() { pages.first().map(|p| p.label.clone()).unwrap_or_default() } else { o.title.clone() };
     let fonts = if o.text_as_geometry { fonts::Fonts::default() } else { fonts::Fonts::collect(pages.iter().map(|p| &p.list)) };
-    Ok(assemble(d, &pages, &fonts, o, &title))
+    Ok((assemble(d, &pages, &fonts, o, &title), warnings))
 }
 
 /// One plotted sheet, ready to be written as a page.
@@ -403,7 +425,7 @@ struct SheetPage {
 }
 
 /// Plot one space.
-fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<SheetPage> {
+fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<(SheetPage, Vec<String>)> {
     let page = page_for(d, space, o)?;
     let unit_mm = paper::page_unit_mm(d, &page);
     let sheet = Sheet::from_page(&page, unit_mm);
@@ -433,11 +455,11 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     // frames are not kept, plot like `layout`. The `fit` option asked for explicitly fits the
     // paper-space extents (or the window) whatever the setup says, centred.
     let forced_fit = !model && o.fit == Some(true);
-    let paper_window = (!model && page.plot_area.eq_ignore_ascii_case("window"))
+    let mut paper_window = (!model && page.plot_area.eq_ignore_ascii_case("window"))
         .then_some(page.window)
         .flatten()
         .filter(|w| w.min.is_finite() && w.max.is_finite() && !w.is_empty());
-    let extents_area = !model && paper_window.is_none() && (page.plot_area.eq_ignore_ascii_case("extents") || forced_fit);
+    let mut extents_area = !model && paper_window.is_none() && (page.plot_area.eq_ignore_ascii_case("extents") || forced_fit);
     let framed = extents_area || paper_window.is_some();
     let fit = o.fit.unwrap_or(model || window.is_some() || (framed && page.scale_to_fit));
     let scale = if model { o.scale } else { o.scale.or(Some(page.scale)) };
@@ -448,7 +470,42 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
-    let b = window.or(paper_window).unwrap_or(list.bounds);
+    // What the page shows, now that what the layout draws is known: a window that lies outside
+    // it would leave the page blank, as would a sheet whose objects all lie beyond it.
+    let drawn = list.bounds;
+    let label = sheet_name(space);
+    let span = |b: &Bounds2| format!("x {:.1}..{:.1}, y {:.1}..{:.1}", b.min.x, b.max.x, b.min.y, b.max.y);
+    let mut warnings = Vec::new();
+    if let Some(w) = paper_window
+        && !drawn.is_empty()
+        && !w.intersects(&drawn)
+    {
+        if forced_fit {
+            warnings.push(format!(
+                "{label}: the page setup's window ({}) lies outside what the layout draws ({}); the extents were plotted instead",
+                span(&w),
+                span(&drawn)
+            ));
+            paper_window = None;
+            extents_area = true;
+        } else {
+            warnings.push(format!(
+                "{label}: the page setup's window ({}) lies outside what the layout draws ({}): the page is blank; `fit` (convert --fit) plots the extents",
+                span(&w),
+                span(&drawn)
+            ));
+        }
+    }
+    let framed = extents_area || paper_window.is_some();
+    let fit = o.fit.unwrap_or(model || window.is_some() || (framed && page.scale_to_fit));
+    if !model && !framed && !drawn.is_empty() && !drawn.intersects(&sheet.bounds()) {
+        warnings.push(format!(
+            "{label}: the layout's objects ({}) lie outside its sheet ({}): the page is blank; `fit` (convert --fit) plots them",
+            span(&drawn),
+            span(&sheet.bounds())
+        ));
+    }
+    let b = window.or(paper_window).unwrap_or(drawn);
     let s = plot_scale(&b, &sheet, fit, scale);
     let origin = sheet.origin;
     let map = if model {
@@ -485,7 +542,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+    Ok((SheetPage { media, list, map, clip_pt, layers, links, label }, warnings))
 }
 
 /// Where a layout's paper-space extents `b` go when its page setup plots the extents: centred
@@ -599,22 +656,119 @@ pub(crate) fn plot_scale(b: &Bounds2, sheet: &Sheet, fit: bool, scale: Option<f6
     if s.is_finite() && s > 0.0 { s } else { 1.0 }
 }
 
-/// A number for a content stream: short, finite, no exponent.
+/// A number for a content stream: short, finite, no exponent (three decimals, trailing zeros
+/// dropped). Written digit by digit: a plot writes millions of them, and formatting each one
+/// through `format!` took a third of a large page's time.
 fn num(out: &mut String, v: f64) {
     let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
-    let mut s = format!("{v:.3}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
+    // Thousandths, rounded half to even like `{:.3}`.
+    let scaled = v.abs() * 1000.0;
+    let floor = scaled.floor();
+    let rest = scaled - floor;
+    let rounded = if rest > 0.5 || (rest == 0.5 && floor % 2.0 == 1.0) { floor + 1.0 } else { floor };
+    let thousandths = rounded as u64;
+    if thousandths == 0 {
+        out.push('0');
+        return;
+    }
+    if v < 0.0 {
+        out.push('-');
+    }
+    let (int, frac) = (thousandths / 1000, thousandths % 1000);
+    let mut digits = [0u8; 20];
+    let mut n = digits.len();
+    let mut i = int;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + (i % 10) as u8;
+        i /= 10;
+        if i == 0 {
+            break;
         }
     }
-    if s == "-0" {
-        s = "0".into();
+    out.push_str(std::str::from_utf8(digits.get(n..).unwrap_or(b"0")).unwrap_or("0"));
+    if frac != 0 {
+        let f = [b'0' + (frac / 100) as u8, b'0' + ((frac / 10) % 10) as u8, b'0' + (frac % 10) as u8];
+        let keep = if f[2] != b'0' {
+            3
+        } else if f[1] != b'0' {
+            2
+        } else {
+            1
+        };
+        out.push('.');
+        out.push_str(std::str::from_utf8(f.get(..keep).unwrap_or(b"")).unwrap_or(""));
     }
-    out.push_str(&s);
+}
+
+#[cfg(test)]
+mod num_tests {
+    use super::num;
+
+    /// What `num` wrote before, through `format!`.
+    fn reference(v: f64) -> String {
+        let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
+        let mut s = format!("{v:.3}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        if s == "-0" {
+            s = "0".into();
+        }
+        s
+    }
+
+    #[test]
+    fn numbers_are_written_as_format_wrote_them() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            0.0005,
+            0.0625,
+            -0.0625,
+            1.0005,
+            72.0,
+            90.0,
+            0.709,
+            841.89,
+            595.276,
+            1e7,
+            -1e7,
+            2e9,
+            f64::NAN,
+            f64::INFINITY,
+            0.001,
+            0.0004,
+            0.9995,
+            999.9995,
+            123456.789,
+        ];
+        let mut x = 0.37_f64;
+        for _ in 0..20_000 {
+            x = (x * 7919.0 + 0.123).rem_euclid(20_000.0) - 10_000.0;
+            values.push(x);
+            values.push(x / 1000.0);
+        }
+        for v in values {
+            let mut s = String::new();
+            num(&mut s, v);
+            let r = reference(v);
+            if s != r {
+                // Only the multiplication's last-bit rounding may differ from an exact decimal
+                // expansion, and then by one thousandth.
+                let (a, b): (f64, f64) = (s.parse().unwrap(), r.parse().unwrap());
+                assert!((a - b).abs() <= 0.0011, "{v}: {s} vs {r}");
+            }
+        }
+    }
 }
 
 fn pt(out: &mut String, p: Vec2) {

@@ -924,3 +924,15 @@ fn cancelled_build_stops_early() {
     assert!(!crate::hatch::pattern_lines_until(&drawing, &h, &loops, 0.0, None, None).is_empty());
     assert!(crate::hatch::pattern_lines_until(&drawing, &h, &loops, 0.0, None, set.as_deref()).is_empty());
 }
+
+#[test]
+fn layer_index_finds_what_the_drawing_lookup_finds() {
+    let mut d = sample();
+    d.layers.push(cadcraft_doc::Layer { name: "Walls".into(), ..cadcraft_doc::Layer::default() });
+    d.layers.push(cadcraft_doc::Layer { name: "WALLS".into(), ..cadcraft_doc::Layer::default() });
+    let li = crate::LayerIndex::new(&d);
+    for name in ["0", "walls", "WALLS", "Walls", "nope", ""] {
+        assert_eq!(li.layer(&d, name).map(|l| l.name.as_str()), d.layer(name).map(|l| l.name.as_str()), "{name}");
+        assert_eq!(li.index(name), d.layers.iter().position(|l| l.name.eq_ignore_ascii_case(name)).map(|i| i as u32), "{name}");
+    }
+}

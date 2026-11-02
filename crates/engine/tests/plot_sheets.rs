@@ -6,8 +6,8 @@ use cadcraft_engine::cmd::file::{IoHooks, base64_decode, set_io};
 use serde_json::{Value, json};
 
 /// A plotter that echoes the sheets it was asked for.
-fn fake_plot(_: &cadcraft_doc::Drawing, space: &cadcraft_doc::Space, opts: &Value) -> Result<Vec<u8>, String> {
-    Ok(format!("%PDF-1.4 {space:?} {}", opts.get("layouts").map(Value::to_string).unwrap_or_default()).into_bytes())
+fn fake_plot(_: &cadcraft_doc::Drawing, space: &cadcraft_doc::Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>), String> {
+    Ok((format!("%PDF-1.4 {space:?} {}", opts.get("layouts").map(Value::to_string).unwrap_or_default()).into_bytes(), Vec::new()))
 }
 
 fn session() -> Session {
@@ -46,4 +46,20 @@ fn bad_sheet_lists_are_errors() {
     {
         assert!(s.execute("exportpdf", &p).is_err(), "{p}");
     }
+}
+
+#[test]
+fn page_setup_takes_the_extents_and_window_areas() {
+    let mut s = session();
+    let r = s.execute("pagesetup", &json!({"layout": "Sheet B", "plotArea": "extents", "scaleToFit": true})).unwrap();
+    assert_eq!(r["page"]["plotArea"], "extents");
+    assert!(s.execute("pagesetup", &json!({"layout": "Sheet B", "plotArea": "window"})).is_err(), "a window area needs its window");
+    let r = s.execute("pagesetup", &json!({"layout": "Sheet B", "plotArea": "window", "window": [[110, 70], [10, 20]]})).unwrap();
+    assert_eq!(r["page"]["plotArea"], "window");
+    assert_eq!((r["page"]["window"]["min"]["x"].as_f64(), r["page"]["window"]["max"]["y"].as_f64()), (Some(10.0), Some(70.0)));
+    assert!(s.execute("pagesetup", &json!({"layout": "Sheet B", "window": [[1, 1], [1, 5]]})).is_err(), "a flat window");
+    assert!(s.execute("pagesetup", &json!({"layout": "Sheet B", "plotArea": "limits"})).is_err(), "limits are not plotted yet");
+    // The plot result carries the plotter's warnings (none from this stand-in).
+    let r = s.execute("exportpdf", &json!({"layout": "Sheet B"})).unwrap();
+    assert_eq!(r["warnings"], json!([]));
 }

@@ -2711,3 +2711,84 @@ fn large_pdf_streams_compress_at_the_fast_level_and_inflate_back() {
     assert_eq!(back, data);
     assert!(body.len() < data.len() / 10, "{} bytes", body.len());
 }
+
+/// A metric A4 landscape layout (5 mm margins) with a frame on the sheet.
+fn framed_layout() -> (Drawing, Space) {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+    }
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(0.0, 0.0), Vec2::new(287.0, 0.0), Vec2::new(287.0, 200.0), Vec2::new(0.0, 200.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    (d, paper)
+}
+
+#[test]
+fn pdf_layout_window_outside_the_drawing_warns_and_fit_plots_the_extents_instead() {
+    let (mut d, paper) = framed_layout();
+    {
+        let p = &mut d.layouts[0].page;
+        p.plot_area = "window".into();
+        p.window = Some(Bounds2::new(Vec2::new(1000.0, 1000.0), Vec2::new(1100.0, 1050.0)));
+        p.scale_to_fit = true;
+    }
+    // As the page setup says: the window is plotted, blank, with a warning.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({})).unwrap();
+    let content = check_pdf(&bytes);
+    assert!(
+        path_points(&content).iter().all(|p| p.x > 2000.0 || p.x < -1000.0 || p.y > 2000.0 || p.y < -1000.0),
+        "nothing of the frame lands on the page"
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("window") && warnings[0].contains("lies outside") && warnings[0].contains("blank"), "{}", warnings[0]);
+    // With `fit`: the extents are plotted instead, fitted and centred, and the warning says so.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({"fit": true})).unwrap();
+    let b = path_points(&check_pdf(&bytes)).iter().fold(Bounds2::EMPTY, |mut b, p| {
+        b.add(*p);
+        b
+    });
+    // The 287 x 200 frame fits the printable area exactly: scale 1, from 5 mm to 292 mm.
+    let k = 72.0 / 25.4;
+    assert!((b.min.x - 5.0 * k).abs() < 0.05 && (b.max.x - 292.0 * k).abs() < 0.05, "{b:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("extents were plotted instead"), "{}", warnings[0]);
+}
+
+#[test]
+fn pdf_layout_objects_outside_the_sheet_warn() {
+    let (mut d, paper) = framed_layout();
+    // Move the frame far from the sheet: plot area `layout` keeps the sheet, which is blank.
+    for e in d.layouts[0].entities.iter().map(|e| e.handle).collect::<Vec<_>>() {
+        let _ = d.modify_entity(e, |e| {
+            if let EntityKind::LwPolyline(p) = &mut e.kind {
+                for v in &mut p.vertices {
+                    v.p += Vec2::new(5000.0, 5000.0);
+                }
+            }
+        });
+    }
+    let (_, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({})).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("lie outside its sheet") && warnings[0].contains("blank"), "{}", warnings[0]);
+    // With `fit` they are plotted, without a warning.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({"fit": true})).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(path_points(&check_pdf(&bytes)).iter().all(|p| p.x >= 14.0 && p.x <= 828.0), "fitted onto the page");
+    // Objects on the sheet: no warning.
+    let (_, warnings) = plot_with_warnings(&framed_layout().0, &paper, &serde_json::json!({})).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
