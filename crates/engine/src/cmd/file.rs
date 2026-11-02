@@ -88,6 +88,17 @@ pub type WriteAsHook = fn(&Drawing, &str, &SaveAs) -> std::result::Result<Vec<u8
 
 static WRITE_AS: OnceLock<WriteAsHook> = OnceLock::new();
 
+/// Write a drawing with [`SaveAs`] options and say what the file written lacks (a DWG read back
+/// and counted against the drawing): installed by hosts whose writer can; saves then prefer it.
+pub type WriteNotedHook = fn(&Drawing, &str, &SaveAs) -> std::result::Result<(Vec<u8>, Vec<String>), String>;
+static WRITE_NOTED: OnceLock<WriteNotedHook> = OnceLock::new();
+pub fn set_write_noted(h: WriteNotedHook) {
+    let _ = WRITE_NOTED.set(h);
+}
+pub fn write_noted() -> Option<WriteNotedHook> {
+    WRITE_NOTED.get().copied()
+}
+
 /// The host's reader that keeps every object a file has, whatever the cost (OPEN `keepAll`:
 /// the DGN line-style objects a drawing otherwise keeps a bounded number of).
 pub type ReadAllHook = fn(&[u8], &str) -> std::result::Result<Drawing, String>;
@@ -146,20 +157,25 @@ fn is_dxf(path: &str) -> bool {
 
 /// The drawing written to `path` with `opts`: through [`IoHooks::write`] when no option is set,
 /// else through the [`write_as`] hook.
-fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<u8>> {
+/// The bytes to write for `path`, with what the file lacks of the drawing (a DWG's records the
+/// writer left out), when the host's writer can tell.
+fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<(Vec<u8>, Vec<String>)> {
     let hooks = io().ok_or_else(|| bad(cmd, "file formats are not available in this build"))?;
     if opts.binary && !is_dxf(path) {
         return Err(bad(cmd, "binary applies to DXF files only"));
     }
     // A drawing file is the drawing outside the Block Editor; an image is what is shown.
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
+    if let Some(w) = write_noted() {
+        return w(d, path, opts).map_err(|e| bad(cmd, e));
+    }
     let r = if *opts == SaveAs::default() {
         (hooks.write)(d, path)
     } else {
         let w = write_as().ok_or_else(|| bad(cmd, "saving at a chosen version or as binary DXF is not available in this build"))?;
         w(d, path, opts)
     };
-    r.map_err(|e| bad(cmd, e))
+    r.map(|b| (b, Vec::new())).map_err(|e| bad(cmd, e))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -320,6 +336,7 @@ fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, pat
         st.binary_dxf = binary_dxf;
     }
     for note in notes {
+        log::warn!("{note}");
         s.echo(note);
     }
     i
@@ -390,24 +407,30 @@ fn run_closeall(s: &mut Session, _p: &Value) -> Result<Value> {
     ok()
 }
 
-pub(crate) fn save_to(s: &mut Session, path: &str) -> Result<usize> {
+pub(crate) fn save_to(s: &mut Session, path: &str) -> Result<(usize, Vec<String>)> {
     let opts = SaveAs { version: None, binary: s.state()?.binary_dxf && is_dxf(path) };
     save_as(s, "save", path, &opts)
 }
 
 /// Save to `path` with `opts`. A drawing file then keeps the version and binary choice: the
 /// version goes into the drawing's `$ACADVER`, so later saves (QSAVE) write it again.
-fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usize> {
+/// Save to `path` with `opts`: the bytes written and the warnings (what reading the drawing left
+/// out, then what the file written lacks), which are also said on the command line.
+fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<(usize, Vec<String>)> {
     if s.doc()?.refedit.is_some() {
         return Err(bad(cmd, "A block reference is being edited in place: finish with REFCLOSE (Save or Discard) before saving."));
     }
-    let bytes = write_bytes(s, cmd, path, opts)?;
+    let (bytes, lacks) = write_bytes(s, cmd, path, opts)?;
     let n = commit_save(s, path, &bytes, store)?;
+    let mut warnings = Vec::new();
     if is_drawing_file(path) {
-        // The file written lacks what reading the drawing left out: said on the command line
-        // too (the reply carries it as `warnings`).
-        for note in s.doc()?.read_notes.clone() {
-            s.echo(format!("Warning: {note}"));
+        // The file written lacks what reading the drawing left out, and what the writer left
+        // out: said on the command line too (the reply carries them as `warnings`).
+        warnings = s.doc()?.read_notes.clone();
+        warnings.extend(lacks);
+        for w in &warnings {
+            log::warn!("{w}");
+            s.echo(format!("Warning: {w}"));
         }
         let st = s.state_mut()?;
         st.binary_dxf = opts.binary;
@@ -418,7 +441,7 @@ fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usiz
             st.saved = st.drawing().clone();
         }
     }
-    Ok(n)
+    Ok((n, warnings))
 }
 
 /// Put saved bytes where the user gets them: natively the file at `path` (written atomically); on
@@ -473,15 +496,15 @@ fn run_save(s: &mut Session, p: &Value) -> Result<Value> {
         Some(p) => p.to_string(),
         None => s.state()?.path.clone().ok_or_else(|| bad("qsave", "drawing has no file name yet; use saveas {path}"))?,
     };
-    let n = save_to(s, &path)?;
-    Ok(with_read_notes(s, &path, saved(&path, n)))
+    let (n, warnings) = save_to(s, &path)?;
+    Ok(with_warnings(&path, saved(&path, n), warnings))
 }
 
-/// A drawing-file save's reply with `warnings`: what reading the drawing left out, which the
+/// A drawing-file save's reply with `warnings`: what reading the drawing left out and what the
 /// file written lacks (as a plot's reply warns about its page).
-fn with_read_notes(s: &Session, path: &str, mut r: Value) -> Value {
+fn with_warnings(path: &str, mut r: Value, warnings: Vec<String>) -> Value {
     if is_drawing_file(path) {
-        r["warnings"] = json!(s.doc().map(|d| d.read_notes.clone()).unwrap_or_default());
+        r["warnings"] = json!(warnings);
     }
     r
 }
@@ -489,8 +512,8 @@ fn with_read_notes(s: &Session, path: &str, mut r: Value) -> Value {
 fn run_saveas(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("saveas", "`path` is required"))?.to_string();
     let opts = save_options("saveas", p)?;
-    let n = save_as(s, "saveas", &path, &opts)?;
-    let mut r = with_read_notes(s, &path, saved(&path, n));
+    let (n, warnings) = save_as(s, "saveas", &path, &opts)?;
+    let mut r = with_warnings(&path, saved(&path, n), warnings);
     if is_drawing_file(&path) {
         r["version"] = json!(opts.version.unwrap_or_else(|| drawing_version(s, &path)).year());
         r["binary"] = json!(opts.binary);
@@ -521,7 +544,7 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = save_options("document.bytes", p)?;
     let version = opts.version.unwrap_or_else(|| drawing_version(s, &format!("drawing.{fmt}")));
     let lost = not_saved_as(s.doc()?, version);
-    let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
+    let (bytes, _lacks) = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
     if drops_unknown(&format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);

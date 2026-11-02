@@ -183,6 +183,9 @@ fn install_io() {
         plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
     });
     cadcraft_engine::cmd::file::set_read_all(|b, name| cadcraft_io::read_all(b, name).map_err(|e| e.to_string()));
+    cadcraft_engine::cmd::file::set_write_noted(|d, name, o| {
+        cadcraft_io::write_with_warnings(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
+    });
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
@@ -307,12 +310,18 @@ fn export_framed(s: &Session, out: &str, window: Option<Bounds2>) -> Result<(), 
     // Raster images with relative paths are found next to the drawing.
     let dir = s.state().ok().and_then(|st| st.path.clone()).and_then(|f| std::path::Path::new(&f).parent().map(|p| p.to_string_lossy().into_owned()));
     let dir = dir.map(|p| if p.is_empty() { ".".to_string() } else { p });
-    let bytes = cadcraft_io::write_framed_from(d, out, window, dir).map_err(|e| e.to_string())?;
+    // A drawing file: written with what it lacks (a DWG read back and counted against the
+    // drawing); an image: framed.
+    let (bytes, lacks) = if is_drawing_output(out) {
+        cadcraft_io::write_with_warnings(d, out, &cadcraft_io::SaveOptions::default()).map_err(|e| e.to_string())?
+    } else {
+        (cadcraft_io::write_framed_from(d, out, window, dir).map_err(|e| e.to_string())?, Vec::new())
+    };
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
-    // A drawing file written lacks what reading the drawing left out.
+    // A drawing file written lacks what reading the drawing left out, and what the writer did.
     if is_drawing_output(out) {
-        for note in &d.read_notes {
+        for note in d.read_notes.iter().chain(&lacks) {
             eprintln!("warning: {note}");
         }
     }

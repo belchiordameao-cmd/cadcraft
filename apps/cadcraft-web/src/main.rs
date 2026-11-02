@@ -80,6 +80,9 @@ mod web {
             plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
         });
         cadcraft_engine::cmd::file::set_read_all(|b, name| cadcraft_io::read_all(b, name).map_err(|e| e.to_string()));
+        cadcraft_engine::cmd::file::set_write_noted(|d, name, o| {
+            cadcraft_io::write_with_warnings(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
+        });
         cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
             cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
         });
