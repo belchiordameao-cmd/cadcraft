@@ -404,6 +404,11 @@ fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usiz
     let bytes = write_bytes(s, cmd, path, opts)?;
     let n = commit_save(s, path, &bytes, store)?;
     if is_drawing_file(path) {
+        // The file written lacks what reading the drawing left out: said on the command line
+        // too (the reply carries it as `warnings`).
+        for note in s.doc()?.read_notes.clone() {
+            s.echo(format!("Warning: {note}"));
+        }
         let st = s.state_mut()?;
         st.binary_dxf = opts.binary;
         if let Some(v) = opts.version
