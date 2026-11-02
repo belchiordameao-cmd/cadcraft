@@ -59,9 +59,12 @@ const USAGE: &str = "usage:
   cadcraft-cli info FILE.dxf
   cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING]
   cadcraft-cli info FILE --layouts   page setup + viewport fields of every layout (diagnostics)
-  cadcraft-cli convert IN.dxf OUT.pdf --layout NAME [--layout NAME2]... | --layout all
+  cadcraft-cli convert IN.dxf OUT.pdf --layout NAME [--layout NAME2]... | --layout all | --layout sheets [--fit]
                            plot paper-space layouts at their page setup (paper, scale, plot
-                           area); several layouts write OUT-<layout>.pdf each.
+                           area); several layouts write OUT-<layout>.pdf each. `all` is the
+                           Model (when it has objects) and every layout, `sheets` every layout
+                           without the Model. --fit scales each layout's contents to fit its
+                           printable area instead.
   cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT [--lazy] [--launch]]
@@ -249,7 +252,15 @@ fn layouts_report(s: &Session) -> Result<Value, String> {
                 },
             );
             let extents = (!ext.is_empty()).then(|| json!([[ext.min.x, ext.min.y], [ext.max.x, ext.max.y]]));
-            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "viewports": viewports })
+            // The plot style table the plot will apply: the page setup's, when it is a table the
+            // drawing has or a built-in one; otherwise objects plot in their own colours.
+            let table = &l.page.plot_style_table;
+            let plot_style = match cadcraft_engine::doc::plot_style_table(d, table) {
+                Some(t) => json!({ "name": t.name, "description": t.description, "colorDependent": t.is_color_dependent() }),
+                None if table.trim().is_empty() || table.trim().eq_ignore_ascii_case("none") => json!("none: object colours"),
+                None => json!(format!("`{table}` is not available: object colours")),
+            };
+            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "plotStyle": plot_style, "viewports": viewports })
         })
         .collect();
     Ok(json!({ "layouts": layouts }))
@@ -311,9 +322,12 @@ fn check_framed_output(framing: Framing, out: Option<&str>) -> Result<(), String
     }
 }
 
-/// `--layout` checks: a PDF output and no model-space framing.
-fn check_layout_output(layouts: &[String], framing: Framing, out: &str) -> Result<(), String> {
+/// `--layout` checks: a PDF output and no model-space framing; `--fit` goes with it.
+fn check_layout_output(layouts: &[String], framing: Framing, out: &str, fit: bool) -> Result<(), String> {
     if layouts.is_empty() {
+        if fit {
+            return Err("--fit only applies with --layout".into());
+        }
         return Ok(());
     }
     if !out.to_ascii_lowercase().ends_with(".pdf") {
@@ -328,48 +342,65 @@ fn check_layout_output(layouts: &[String], framing: Framing, out: &str) -> Resul
 fn convert(args: &[String]) -> Result<(), String> {
     let mut framing = Framing::Auto;
     let mut layouts: Vec<String> = Vec::new();
+    let mut fit = false;
     let mut files = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--layout" {
             layouts.push(it.next().ok_or("--layout needs a layout name (or `all`)")?.clone());
+        } else if a == "--fit" {
+            fit = true;
         } else if !framing_option(a, &mut it, &mut framing)? {
             files.push(a);
         }
     }
     let [i, o] = files.as_slice() else { return Err(USAGE.into()) };
     check_framed_output(framing, Some(o))?;
-    check_layout_output(&layouts, framing, o)?;
+    check_layout_output(&layouts, framing, o, fit)?;
     let mut s = Session::empty();
     open(&mut s, i)?;
     if let Some(m) = skipped_message(s.doc().map_err(|e| e.to_string())?, i) {
         eprintln!("{m}");
     }
     if !layouts.is_empty() {
-        return convert_layouts(&mut s, &layouts, o);
+        return convert_layouts(&mut s, &layouts, o, fit);
     }
     let window = export_window(&s, framing, None)?;
     export_framed(&s, o, window)
 }
 
-/// Plot layouts at their page setup. One layout writes `OUT.pdf`; several (or `all`) write
-/// `OUT-<layout>.pdf` each, as `publish` does.
-fn convert_layouts(s: &mut Session, layouts: &[String], out: &str) -> Result<(), String> {
+/// Plot layouts at their page setup (or, with `fit`, their contents fitted to the printable
+/// area). One layout writes `OUT.pdf`; several (or `all`) write `OUT-<layout>.pdf` each, as
+/// `publish` does.
+fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) -> Result<(), String> {
+    let with_fit = |mut q: Value| {
+        if fit {
+            q["fit"] = json!(true);
+        }
+        q
+    };
+    let group = |n: &str| n.eq_ignore_ascii_case("all") || n.eq_ignore_ascii_case("sheets");
     if let [one] = layouts
-        && !one.eq_ignore_ascii_case("all")
+        && !group(one)
     {
-        let r = s.execute("exportpdf", &json!({ "path": out, "layout": one })).map_err(|e| e.to_string())?;
+        let r = s.execute("exportpdf", &with_fit(json!({ "path": out, "layout": one }))).map_err(|e| e.to_string())?;
         eprintln!("wrote {out} ({} bytes, layout {one})", r["bytes"].as_u64().unwrap_or(0));
         return Ok(());
     }
-    if layouts.len() > 1 && layouts.iter().any(|l| l.eq_ignore_ascii_case("all")) {
-        return Err("--layout all cannot be combined with layout names".into());
+    if layouts.len() > 1 && layouts.iter().any(|l| group(l)) {
+        return Err("--layout all / sheets cannot be combined with layout names".into());
     }
     let mut q = json!({ "path": out });
-    if !layouts[0].eq_ignore_ascii_case("all") {
+    if layouts[0].eq_ignore_ascii_case("sheets") {
+        // Every layout in tab order, without the Model.
+        let d = s.doc().map_err(|e| e.to_string())?;
+        let mut ls: Vec<&cadcraft_engine::doc::Layout> = d.layouts.iter().collect();
+        ls.sort_by_key(|l| l.tab_order);
+        q["layouts"] = json!(ls.iter().map(|l| l.name.clone()).collect::<Vec<_>>());
+    } else if !layouts[0].eq_ignore_ascii_case("all") {
         q["layouts"] = json!(layouts);
     }
-    let r = s.execute("publish", &q).map_err(|e| e.to_string())?;
+    let r = s.execute("publish", &with_fit(q)).map_err(|e| e.to_string())?;
     for sheet in r["sheets"].as_array().into_iter().flatten() {
         eprintln!(
             "wrote {} ({} bytes, layout {})",
@@ -964,9 +995,18 @@ mod tests {
         for n in ["all-Model.pdf", "all-SHEET A.pdf", "all-SHEET B.pdf"] {
             assert!(dir.join(n).exists(), "{n}");
         }
+        // `sheets`: every layout, without the Model.
+        convert(&a(&[&path("in.dxf"), &path("sh.pdf"), "--layout", "sheets"])).unwrap();
+        assert!(dir.join("sh-SHEET A.pdf").exists() && dir.join("sh-SHEET B.pdf").exists() && !dir.join("sh-Model.pdf").exists());
+        assert!(convert(&a(&[&path("in.dxf"), &path("x.pdf"), "--layout", "sheets", "--layout", "SHEET A"])).is_err());
+
+        // --fit goes with --layout.
+        convert(&a(&[&path("in.dxf"), &path("fit.pdf"), "--layout", "SHEET A", "--fit"])).unwrap();
+        assert!(std::fs::read(path("fit.pdf")).unwrap().starts_with(b"%PDF"));
 
         // Misuse is an error and writes nothing.
         let err = |v: &[&str]| convert(&a(v)).unwrap_err();
+        assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--fit"]).contains("--fit"));
         assert!(err(&[&path("in.dxf"), &path("x.png"), "--layout", "SHEET A"]).contains("PDF"));
         assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--layout", "SHEET A", "--view", "extents"]).contains("--window/--view"));
         assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--layout", "all", "--layout", "SHEET A"]).contains("all"));

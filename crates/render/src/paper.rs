@@ -122,10 +122,17 @@ impl Sheet {
     }
 }
 
+/// Millimetres per paper-space unit of a layout: its page setup's plot paper units
+/// ([`PageSetup::paper_unit_mm`], DXF group 72) when it has them, else the drawing's
+/// ([`paper_unit_mm`]).
+pub fn page_unit_mm(d: &Drawing, page: &PageSetup) -> f64 {
+    if page.paper_unit_mm.is_finite() && page.paper_unit_mm > 0.0 { page.paper_unit_mm } else { paper_unit_mm(d) }
+}
+
 /// The sheet of a named layout (`None` if there is no such layout).
 pub fn sheet(d: &Drawing, layout: &str) -> Option<Sheet> {
     let l = d.layouts.iter().find(|l| l.name == layout).or_else(|| d.layout(layout))?;
-    Some(Sheet::from_page(&l.page, paper_unit_mm(d)))
+    Some(Sheet::from_page(&l.page, page_unit_mm(d, &l.page)))
 }
 
 #[cfg(test)]

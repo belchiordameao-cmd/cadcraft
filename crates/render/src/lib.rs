@@ -715,6 +715,9 @@ pub fn viewport_content(d: &Drawing, space: &Space, handle: Handle, area: Bounds
     let styler = style_table(d, space, opts, false).map(|t| plotstyle::Styler::new(d, t));
     let mut b =
         Builder { list: DisplayList::default(), opts, plotting: false, styles: styler.as_ref(), named: None, shared_budget: None, transparency: 0 };
+    if let Space::Paper(name) = space {
+        b.list.sheet = paper::sheet(d, name);
+    }
     contents(&mut b, d, vp, area, &Clip::Rect(area));
     b.list
 }
@@ -815,7 +818,7 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
         }
     }
     // The contents are in paper units now: draw their pens before clipping.
-    pen::apply(&mut sub.list, paper::paper_unit_mm(d));
+    pen::apply(&mut sub.list, b.list.sheet.map_or_else(|| paper::paper_unit_mm(d), |s| s.unit_mm));
     b.list.expanded = b.list.expanded.saturating_add(sub.list.expanded);
     let starts = append_clipped(&mut b.list, &sub.list, clip);
     // Images keep the pieces of their placeholder that are left, clipped by the viewport too.

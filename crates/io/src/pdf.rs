@@ -405,7 +405,7 @@ struct SheetPage {
 /// Plot one space.
 fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<SheetPage> {
     let page = page_for(d, space, o)?;
-    let unit_mm = paper::paper_unit_mm(d);
+    let unit_mm = paper::page_unit_mm(d, &page);
     let sheet = Sheet::from_page(&page, unit_mm);
     let lineweights = o.lineweights.unwrap_or(if space.is_paper() { page.lineweights } else { true });
     let plot_style_table = cadcraft_doc::plot_style_table(d, &page.plot_style_table).map(std::sync::Arc::new);
@@ -428,26 +428,34 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     // Model space fits its extents (or the window) to the printable area. A layout plots as its
     // page setup says: plot area `layout` (the default) is the whole sheet with paper point
     // (0, 0) at the printable corner, at the plot scale; `extents` is the paper-space extents
-    // fitted to the printable area (or at the plot scale), centred when the setup says so.
-    // `display`, `limits` and `window`, whose frames are not kept, plot like `layout`.
-    let extents_area = !model && page.plot_area.eq_ignore_ascii_case("extents");
-    let fit = o.fit.unwrap_or(model || window.is_some() || (extents_area && page.scale_to_fit));
+    // and `window` the saved window, fitted to the printable area (or at the plot scale),
+    // centred when the setup says so, else from the plot origin. `display` and `limits`, whose
+    // frames are not kept, plot like `layout`. The `fit` option asked for explicitly fits the
+    // paper-space extents (or the window) whatever the setup says, centred.
+    let forced_fit = !model && o.fit == Some(true);
+    let paper_window = (!model && page.plot_area.eq_ignore_ascii_case("window"))
+        .then_some(page.window)
+        .flatten()
+        .filter(|w| w.min.is_finite() && w.max.is_finite() && !w.is_empty());
+    let extents_area = !model && paper_window.is_none() && (page.plot_area.eq_ignore_ascii_case("extents") || forced_fit);
+    let framed = extents_area || paper_window.is_some();
+    let fit = o.fit.unwrap_or(model || window.is_some() || (framed && page.scale_to_fit));
     let scale = if model { o.scale } else { o.scale.or(Some(page.scale)) };
     // Chord tolerance: about 0.05 mm on paper.
-    let est = plot_scale(&window.unwrap_or_else(|| d.extents(space)), &sheet, fit, scale);
+    let est = plot_scale(&window.or(paper_window).unwrap_or_else(|| d.extents(space)), &sheet, fit, scale);
     let tol = 0.05 / unit_mm / est.max(1e-300);
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
-    let b = window.unwrap_or(list.bounds);
+    let b = window.or(paper_window).unwrap_or(list.bounds);
     let s = plot_scale(&b, &sheet, fit, scale);
     let origin = sheet.origin;
     let map = if model {
         let (from, to) = placement(space, &b, fit, &sheet, o);
         Map { from, s, to, origin, k }
-    } else if extents_area {
-        let (from, to) = extents_placement(&b, page.center, &sheet);
+    } else if framed {
+        let (from, to) = extents_placement(&b, page.center || forced_fit, &sheet);
         Map { from, s, to, origin, k }
     } else {
         Map { from: Vec2::ZERO, s, to: Vec2::ZERO, origin, k }
@@ -456,11 +464,16 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     let mut list = list;
     cadcraft_render::pen::apply(&mut list, map.s * unit_mm);
     let media = sheet.size * k;
-    let clip_pt = if model || extents_area {
+    let mut clip_pt = if model || framed {
         Bounds2::new((sheet.printable.min - origin) * k, (sheet.printable.max - origin) * k)
     } else {
         Bounds2::new(Vec2::ZERO, media)
     };
+    // A window plots only what lies inside it.
+    if let Some(w) = paper_window {
+        let (a, z) = (map.pt(w.min), map.pt(w.max));
+        clip_pt = Bounds2 { min: clip_pt.min.max(a.min(z)), max: clip_pt.max.min(a.max(z)) };
+    }
     // The layers drawn on, in order of first use.
     let mut layers: Vec<u32> = Vec::new();
     if o.layers {
@@ -973,13 +986,26 @@ fn uri_string(url: &str) -> Option<String> {
     Some(out)
 }
 
+/// Streams larger than this compress at a faster level: a large drawing's content stream
+/// takes seconds at the default level for a few per cent of size (measured: 167 MB in 11.4 s
+/// at level 6 to 38 MB, 3.7 s at level 3 to 40 MB).
+const FAST_COMPRESSION_FROM: usize = 8 << 20;
+
 /// A stream object body, Flate-compressed when asked.
 fn stream(data: &[u8], compress: bool, extra: &str) -> Vec<u8> {
-    let (data, filter) = if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, 6), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
+    let level = if data.len() >= FAST_COMPRESSION_FROM { 3 } else { 6 };
+    let (data, filter) =
+        if compress { (miniz_oxide::deflate::compress_to_vec_zlib(data, level), " /Filter /FlateDecode") } else { (data.to_vec(), "") };
     let mut out = format!("<< /Length {}{filter}{extra} >>\nstream\n", data.len()).into_bytes();
     out.extend_from_slice(&data);
     out.extend_from_slice(b"\nendstream");
     out
+}
+
+/// [`stream`] for the crate's tests.
+#[cfg(test)]
+pub(crate) fn stream_for_test(data: &[u8], compress: bool) -> Vec<u8> {
+    stream(data, compress, "")
 }
 
 /// PDF objects being written: bodies by object number - 1.
