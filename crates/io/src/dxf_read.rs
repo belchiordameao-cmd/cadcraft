@@ -1653,10 +1653,20 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
+    let (secs, outside) = sections_of(bytes)?;
+    read_sections(secs, outside)
+}
+
+/// The sections of a DXF file's groups (the tags move into them: a large file's groups are held
+/// once) and the count of groups outside any section.
+pub fn sections_of(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
     let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
     let outside = outside_sections(&tags);
-    // The tags move into their sections: a large file's groups are held once.
-    let secs = cadcraft_dxf::into_sections(tags);
+    Ok((cadcraft_dxf::into_sections(tags), outside))
+}
+
+/// [`read`] from a file's sections ([`sections_of`]).
+pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }

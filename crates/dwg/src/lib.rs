@@ -38,6 +38,26 @@ impl Limits {
     pub const DEFAULT: Limits = Limits { max_dwg_bytes: 512 << 20, max_dxf_bytes: 1 << 30 };
 }
 
+/// What a DWG read and its DXF rendition cost, and what the reader found
+/// ([`dwg_to_dxf_probed`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DwgProbe {
+    /// Seconds reading the DWG (acadrust).
+    pub read_secs: f64,
+    /// Seconds writing its DXF rendition.
+    pub write_secs: f64,
+    /// Seconds adding the header variables the DXF writer leaves out.
+    pub header_secs: f64,
+    pub source_records: usize,
+    pub decoded_records: usize,
+    pub skipped_records: usize,
+    pub entities: usize,
+    pub objects: usize,
+    pub table_records: usize,
+    pub recovered_errors: usize,
+    pub diagnostics: usize,
+}
+
 /// A byte count in megabytes for messages ("9.9 MB", "1024 MB").
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn mb(n: u64) -> String {
@@ -50,7 +70,7 @@ mod native {
     use std::io::{Cursor, Write};
     use std::panic::AssertUnwindSafe;
 
-    use super::{Limits, mb};
+    use super::{DwgProbe, Limits, mb};
 
     /// Read DWG bytes and return an ASCII DXF rendition, within [`Limits::DEFAULT`].
     pub fn dwg_to_dxf(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -69,24 +89,45 @@ mod native {
     /// file, and the notes say how many were skipped and of which types, so a partial read never
     /// passes for a complete one.
     pub fn dwg_to_dxf_noted(bytes: &[u8], limits: Limits) -> Result<(Vec<u8>, Vec<String>), String> {
+        dwg_to_dxf_probed(bytes, limits).map(|(dxf, notes, _)| (dxf, notes))
+    }
+
+    /// [`dwg_to_dxf_noted`], also reporting what each step cost and what the reader found
+    /// ([`DwgProbe`]), for `cadcraft-cli perf FILE --open`.
+    pub fn dwg_to_dxf_probed(bytes: &[u8], limits: Limits) -> Result<(Vec<u8>, Vec<String>, DwgProbe), String> {
+        use std::time::Instant;
         if bytes.len() > limits.max_dwg_bytes {
             return Err(format!("DWG: the file is {}, larger than the {} CADCraft opens", mb(bytes.len() as u64), mb(limits.max_dwg_bytes as u64)));
         }
+        let t = Instant::now();
         let outcome = std::panic::catch_unwind(|| {
             acadrust::DwgReader::from_stream_with_options(Cursor::new(bytes), acadrust::DwgReadOptions::failsafe()).read_with_stats()
         })
         .map_err(|_| "the DWG reader failed on this file".to_string())?
         .map_err(|e| format!("DWG: {e}"))?;
+        let mut probe = DwgProbe { read_secs: t.elapsed().as_secs_f64(), ..DwgProbe::default() };
         // Failsafe skips records, not whole files: when the objects stream itself couldn't be
         // read (a damaged header or section map, or not a DWG at all), nothing was read.
         if !outcome.stats.record_stream_read {
             let why = outcome.stats.diagnostics.first().map(|d| d.message.trim_start_matches("Failsafe: ").to_string());
             return Err(format!("DWG: {}", why.unwrap_or_else(|| "the file's objects couldn't be read".to_string())));
         }
+        {
+            let st = &outcome.stats;
+            probe.source_records = st.source_records;
+            probe.decoded_records = st.decoded_source_records;
+            probe.skipped_records = st.skipped_source_records;
+            probe.entities = st.output_entities;
+            probe.objects = st.output_objects;
+            probe.table_records = st.output_table_records;
+            probe.recovered_errors = st.recovered_errors;
+            probe.diagnostics = st.diagnostics.len();
+        }
         let notes = read_notes(&outcome.stats);
         let mut doc = outcome.document;
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
+        let t = Instant::now();
         let mut out = CappedWriter { buf: Vec::new(), limit: limits.max_dxf_bytes, exceeded: false };
         let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
             .map_err(|_| "the DWG→DXF conversion failed on this file".to_string())?;
@@ -99,7 +140,11 @@ mod native {
             ));
         }
         written.map_err(|e| format!("DWG→DXF: {e}"))?;
-        Ok((add_header_vars(out.buf, &doc.header), notes))
+        probe.write_secs = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let dxf = add_header_vars(out.buf, &doc.header);
+        probe.header_secs = t.elapsed().as_secs_f64();
+        Ok((dxf, notes, probe))
     }
 
     /// Most record types named in the skipped-records note.
@@ -415,7 +460,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_with, dxf_to_dwg, dxf_to_dwg_as};
+pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_probed, dwg_to_dxf_with, dxf_to_dwg, dxf_to_dwg_as};
 
 /// The error for a DWG version CADCraft can't write.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -430,6 +475,10 @@ pub fn dwg_to_dxf(_bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 #[cfg(target_arch = "wasm32")]
 pub fn dwg_to_dxf_noted(_bytes: &[u8], _limits: Limits) -> Result<(Vec<u8>, Vec<String>), String> {
+    Err("DWG files can't be opened in the web build yet; save as DXF".into())
+}
+#[cfg(target_arch = "wasm32")]
+pub fn dwg_to_dxf_probed(_bytes: &[u8], _limits: Limits) -> Result<(Vec<u8>, Vec<String>, DwgProbe), String> {
     Err("DWG files can't be opened in the web build yet; save as DXF".into())
 }
 #[cfg(target_arch = "wasm32")]

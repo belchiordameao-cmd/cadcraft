@@ -10,6 +10,8 @@ publish = false
 workspace = true
 
 [dependencies]
+cadcraft-dwg = { workspace = true }
+cadcraft-dxf = { workspace = true }
 cadcraft-engine = { workspace = true }
 cadcraft-io = { workspace = true }
 cadcraft-mcp = { workspace = true }

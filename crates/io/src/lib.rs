@@ -189,6 +189,18 @@ pub fn png_view(extents: &Bounds2, width: u32, height: u32, window: Option<Bound
 pub fn read_dxf(bytes: &[u8]) -> Result<Drawing> {
     dxf_read::read(bytes)
 }
+
+/// The sections of a DXF file's groups and the count of groups outside any section: the first
+/// half of [`read_dxf`], for [`read_dxf_sections`].
+pub fn dxf_sections(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
+    dxf_read::sections_of(bytes)
+}
+
+/// [`read_dxf`] from the sections [`dxf_sections`] split, so that a caller can look at the
+/// groups (counts by record type, say) without parsing the text twice.
+pub fn read_dxf_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
+    dxf_read::read_sections(secs, outside)
+}
 /// The drawing as R2000 ASCII DXF, whatever its own version ([`write_with`] chooses one).
 pub fn write_dxf(d: &Drawing) -> String {
     dxf_write::write(d)
