@@ -571,6 +571,8 @@ dependencies = [
 name = "cadcraft-cli"
 version = "0.6.2"
 dependencies = [
+ "cadcraft-dwg",
+ "cadcraft-dxf",
  "cadcraft-engine",
  "cadcraft-io",
  "cadcraft-mcp",
@@ -669,6 +671,7 @@ dependencies = [
  "cadcraft-fonts",
  "cadcraft-geom",
  "cadcraft-render",
+ "image",
  "miniz_oxide 0.8.9",
  "quick-xml",
  "serde",

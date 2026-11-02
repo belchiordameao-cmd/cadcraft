@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 /// What a DXF file holds that CADCraft doesn't model, kept and written back (#528).
+mod dwg_check;
 mod dxf_raw;
 
 mod dxf_ext;
@@ -24,9 +25,9 @@ use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::Bounds2;
 
 pub use cadcraft_dxf::Version;
-pub use dxf_read::entity_from_groups;
-pub use dxf_write::entity_groups;
-pub use pdf::{PdfOptions, pdf, plot};
+pub use dxf_read::{LeftOut, ReadOptions, entity_from_groups};
+pub use dxf_write::{MAX_BRIDGE_COPIES, entity_groups};
+pub use pdf::{PdfOptions, pdf, plot, plot_with_warnings};
 
 /// How a drawing is saved as DXF or DWG.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,16 +61,32 @@ fn ext(name: &str) -> String {
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
+    read_with(bytes, name, &ReadOptions::default())
+}
+
+/// [`read`] keeping every object the file has, whatever the cost ([`ReadOptions::keep_all`]).
+pub fn read_all(bytes: &[u8], name: &str) -> Result<Drawing> {
+    read_with(bytes, name, &ReadOptions { keep_all: true })
+}
+
+/// [`read`] under [`ReadOptions`].
+pub fn read_with(bytes: &[u8], name: &str, o: &ReadOptions) -> Result<Drawing> {
     if cadcraft_dwg::is_dwg(bytes) {
-        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
-        let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
-        d.read_notes = notes;
+        let limits = if o.keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
+        let (dxf, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(bytes, limits).map_err(IoError::Format)?;
+        let converted = |e: IoError| IoError::Format(format!("{e} (in the DXF converted from this DWG)"));
+        let (secs, outside, from_text) = dxf_read::sections_left_out(&dxf, dxf_read::dgn_cap(o)).map_err(converted)?;
+        // What the bridge dropped before writing the text counts with what the text shows.
+        let left_out = dxf_read::left_out_from_dwg(&probe, limits.max_dgn_line_style_objects).unwrap_or(from_text);
+        let mut d = dxf_read::read_sections_left_out(secs, outside, &left_out, &mut |_| {}).map_err(converted)?;
+        // The DWG's notes first, then what reading the DXF text left out.
+        d.read_notes.splice(0..0, notes);
         return Ok(d);
     }
     match ext(name).as_str() {
         "svg" | "svgz" => svg_read::read(bytes),
-        "dxf" | "" => dxf_read::read(bytes),
-        e if bytes.len() > 4 => dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string())),
+        "dxf" | "" => dxf_read::read_with(bytes, o),
+        e if bytes.len() > 4 => dxf_read::read_with(bytes, o).map_err(|_| IoError::Unsupported(e.to_string())),
         e => Err(IoError::Unsupported(e.to_string())),
     }
 }
@@ -99,11 +116,31 @@ pub fn write_with(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<Vec<u8>
         // gradients, so a drawing from an R2000 DXF doesn't lose them by default.
         "dwg" if !opts.binary => {
             let version = opts.version.unwrap_or_else(|| version.max(Version::R2004));
-            cadcraft_dwg::dxf_to_dwg_as(dxf_write::dwg_bridge(d, version).as_bytes(), version.code()).map_err(IoError::Format)
+            cadcraft_dwg::dxf_to_dwg_as(dxf_write::dwg_bridge(d, version).0.as_bytes(), version.code()).map_err(IoError::Format)
         }
         e if opts.binary => Err(IoError::Format(format!("binary output is for DXF files, not `{e}`"))),
         _ => write_framed(d, name, None),
     }
+}
+
+/// [`write_with`], with what the file written lacks. A DWG is read back through the bridge and
+/// its records counted against the text it was written from: the bridge can leave records out
+/// without a word (a real drawing lost a block reference, its attribute and its block that way),
+/// so the loss is reported as a warning, like a plot's blank page. DXF and the image formats
+/// have nothing to report. Reading the DWG back costs about what opening it does.
+pub fn write_with_warnings(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<String>)> {
+    if ext(name) != "dwg" || opts.binary {
+        return write_with(d, name, opts).map(|b| (b, Vec::new()));
+    }
+    let version = opts.version.unwrap_or_else(|| save_version(d).max(Version::R2004));
+    // What the bridge's text already gives up on comes first, then what the DWG read back lacks.
+    let (text, mut warnings) = dxf_write::dwg_bridge(d, version);
+    let bytes = cadcraft_dwg::dxf_to_dwg_as(text.as_bytes(), version.code()).map_err(IoError::Format)?;
+    warnings.extend(match cadcraft_dwg::dwg_to_dxf_noted(&bytes, cadcraft_dwg::Limits::DEFAULT) {
+        Ok((back, _)) => dwg_check::dwg_loss(text.as_bytes(), &back),
+        Err(e) => vec![format!("The DWG written could not be read back ({e}): whether it kept everything is not known.")],
+    });
+    Ok((bytes, warnings))
 }
 
 /// Like [`write`], but image formats (PNG, SVG, PDF) show `window` (a model-space rectangle in
@@ -111,6 +148,12 @@ pub fn write_with(d: &Drawing, name: &str, opts: &SaveOptions) -> Result<Vec<u8>
 /// extents. Formats that are not images (DXF, DWG) ignore the window. The window is checked with
 /// [`check_window`].
 pub fn write_framed(d: &Drawing, name: &str, window: Option<Bounds2>) -> Result<Vec<u8>> {
+    write_framed_from(d, name, window, None)
+}
+
+/// Like [`write_framed`], with the folder a PDF's raster images are looked for in (the
+/// drawing's; see [`PdfOptions::image_dir`]).
+pub fn write_framed_from(d: &Drawing, name: &str, window: Option<Bounds2>, image_dir: Option<String>) -> Result<Vec<u8>> {
     // A drawing template (.dwt) is DWG content.
     if ext(name) == "dwt" {
         return write_framed(d, &format!("{name}.dwg"), None);
@@ -124,7 +167,7 @@ pub fn write_framed(d: &Drawing, name: &str, window: Option<Bounds2>) -> Result<
         "dxf" | "" | "dwg" => write_with(d, name, &SaveOptions::default()),
         "svg" => Ok(svg::export_window(d, &Space::Model, window).into_bytes()),
         "png" => png_framed(d, &Space::Model, 2400, 1600, window),
-        "pdf" => pdf::pdf(d, &Space::Model, &PdfOptions { compress: true, window, ..PdfOptions::default() }),
+        "pdf" => pdf::pdf(d, &Space::Model, &PdfOptions { compress: true, window, image_dir, ..PdfOptions::default() }),
         e => Err(IoError::Unsupported(e.to_string())),
     }
 }
@@ -182,6 +225,48 @@ pub fn png_view(extents: &Bounds2, width: u32, height: u32, window: Option<Bound
 
 pub fn read_dxf(bytes: &[u8]) -> Result<Drawing> {
     dxf_read::read(bytes)
+}
+
+/// The sections of a DXF file's groups and the count of groups outside any section: the first
+/// half of [`read_dxf`], for [`read_dxf_sections`].
+pub fn dxf_sections(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
+    dxf_read::sections_of(bytes)
+}
+
+/// [`dxf_sections`] under [`ReadOptions`], with the account of what was stepped over
+/// ([`LeftOut`]), for [`read_dxf_sections_left_out`].
+pub fn dxf_sections_left_out(bytes: &[u8], o: &ReadOptions) -> Result<(Vec<cadcraft_dxf::Section>, usize, LeftOut)> {
+    dxf_read::sections_left_out(bytes, dxf_read::dgn_cap(o))
+}
+
+/// The account of what the DWG bridge left out of a DWG's DXF text, for
+/// [`read_dxf_sections_left_out`] (it carries what the text can no longer show); `None` when
+/// it left nothing out.
+pub fn left_out_from_dwg(probe: &cadcraft_dwg::DwgProbe, o: &ReadOptions) -> Option<LeftOut> {
+    dxf_read::left_out_from_dwg(probe, dxf_read::dgn_cap(o))
+}
+
+/// [`read_dxf`] from the sections [`dxf_sections`] split, so that a caller can look at the
+/// groups (counts by record type, say) without parsing the text twice.
+pub fn read_dxf_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
+    dxf_read::read_sections(secs, outside)
+}
+
+/// [`read_dxf_sections`] telling `trace` each phase of building the drawing as it starts (and
+/// `done` at the end), for timing them.
+pub fn read_dxf_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
+    dxf_read::read_sections_traced(secs, outside, trace)
+}
+
+/// [`read_dxf_sections_traced`] from sections [`dxf_sections_left_out`] split, so that the
+/// drawing's notes account for what was stepped over.
+pub fn read_dxf_sections_left_out(
+    secs: Vec<cadcraft_dxf::Section>,
+    outside: usize,
+    left_out: &LeftOut,
+    trace: &mut dyn FnMut(&'static str),
+) -> Result<Drawing> {
+    dxf_read::read_sections_left_out(secs, outside, left_out, trace)
 }
 /// The drawing as R2000 ASCII DXF, whatever its own version ([`write_with`] chooses one).
 pub fn write_dxf(d: &Drawing) -> String {

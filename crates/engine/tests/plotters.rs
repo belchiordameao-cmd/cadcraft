@@ -9,8 +9,8 @@ use cadcraft_engine::cmd::plotters::{PlotterStore, set_plotter_store};
 use serde_json::{Value, json};
 
 /// The plot hook echoes the options it gets.
-fn echo_plot(_: &Drawing, _: &Space, opts: &Value) -> Result<Vec<u8>, String> {
-    Ok(opts.to_string().into_bytes())
+fn echo_plot(_: &Drawing, _: &Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>), String> {
+    Ok((opts.to_string().into_bytes(), Vec::new()))
 }
 
 fn session() -> Session {
@@ -83,11 +83,13 @@ fn page_setup_takes_a_device_and_its_papers() {
     assert_eq!(r["page"]["paper"], "Strip");
     let page = &s.doc().unwrap().layout("Layout1").unwrap().page;
     assert_eq!((page.width_mm, page.height_mm, page.margins_mm), (200.0, 600.0, [10.0, 20.0, 10.0, 20.0]));
-    // The printable area shown in the layout follows the device paper.
+    // The printable area shown in the layout follows the device paper: it starts at the
+    // paper-space origin, and the sheet's corner lies a margin below and to the left of it.
     let sheet = cadcraft_render::sheet(s.doc().unwrap(), "Layout1").unwrap();
     let mm = |v: f64| v * sheet.unit_mm;
-    let got = [mm(sheet.printable.min.x), mm(sheet.printable.min.y), mm(sheet.printable.max.x), mm(sheet.printable.max.y)];
-    assert!(got.iter().zip([10.0, 20.0, 190.0, 580.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?}");
+    let got = [mm(sheet.origin.x), mm(sheet.origin.y), mm(sheet.printable.max.x), mm(sheet.printable.max.y)];
+    assert!(got.iter().zip([-10.0, -20.0, 180.0, 560.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{got:?}");
+    assert_eq!(sheet.printable.min, cadcraft_geom::Vec2::ZERO);
 
     // Switching to a built-in device keeps a paper it has, else takes its default (A4).
     s.execute("pagesetup", &json!({"layout": "Layout1", "device": "CADCraft PDF"})).unwrap();

@@ -631,6 +631,7 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
         "margins",
         "lineweights",
         "plotArea",
+        "window",
         "scale",
         "scaleToFit",
         "center",
@@ -706,11 +707,33 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
         if !["layout", "extents", "display", "window", "limits"].contains(&v.as_str()) {
             return Err(bad(cmd, "`plotArea` must be layout, extents, display, window or limits"));
         }
-        // Layout plotting always prints the whole sheet; the other areas are only stored for DXF round trips.
-        if v != "layout" && v != page.plot_area {
-            return Err(bad(cmd, format!("plot area `{v}` is not available yet; layouts plot the whole sheet (`layout`)")));
+        // Layouts plot the whole sheet, their extents or a window; display and limits are only
+        // stored for DXF round trips.
+        if (v == "display" || v == "limits") && v != page.plot_area {
+            return Err(bad(
+                cmd,
+                format!("plot area `{v}` is not available yet; layouts plot the whole sheet (`layout`), their `extents` or a `window`"),
+            ));
         }
         page.plot_area = v;
+    }
+    if let Some(w) = p.get("window") {
+        let corner = |i: usize| {
+            let c = w.get(i)?.as_array()?;
+            let (x, y) = (c.first()?.as_f64()?, c.get(1)?.as_f64()?);
+            (x.is_finite() && y.is_finite() && x.abs() <= 1e9 && y.abs() <= 1e9).then_some(Vec2::new(x, y))
+        };
+        let win = match (w.as_array().map(Vec::len), corner(0), corner(1)) {
+            (Some(2), Some(a), Some(b)) => Bounds2::new(Vec2::new(a.x.min(b.x), a.y.min(b.y)), Vec2::new(a.x.max(b.x), a.y.max(b.y))),
+            _ => return Err(bad(cmd, "`window` must be two corners [[x1, y1], [x2, y2]] in paper units")),
+        };
+        if !(win.width() > 0.0 && win.height() > 0.0) {
+            return Err(bad(cmd, "`window` must have a positive width and height"));
+        }
+        page.window = Some(win);
+    }
+    if page.plot_area == "window" && page.window.is_none() {
+        return Err(bad(cmd, "plot area `window` needs a `window` ([[x1, y1], [x2, y2]] in paper units)"));
     }
     if let Some(v) = str_param(p, "plotStyleTable") {
         page.plot_style_table = v.chars().take(260).collect();
@@ -809,13 +832,23 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         if let Some(w) = plot_window(s, p, cmd, &space)? {
             o.insert("window".into(), json!([[w.min.x, w.min.y], [w.max.x, w.max.y]]));
         }
+        // Raster images with relative paths are found next to the drawing.
+        if !o.contains_key("imageDir")
+            && let Some(dir) = s
+                .state()
+                .ok()
+                .and_then(|st| st.path.clone())
+                .and_then(|f| std::path::Path::new(&f).parent().map(|d| d.to_string_lossy().into_owned()))
+        {
+            o.insert("imageDir".into(), json!(if dir.is_empty() { ".".to_string() } else { dir }));
+        }
         // Without one, the plotter uses each sheet's page setup.
         match super::plotters::plot_transparency(s, p) {
             Some(t) => o.insert("plotTransparency".into(), json!(t)),
             None => o.remove("plotTransparency"),
         };
     }
-    let bytes = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
+    let (bytes, warnings) = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
     let layout = match &sheets {
         Some(names) => names.first().cloned().unwrap_or_default(),
         None => space.tab_name().to_string(),
@@ -829,12 +862,12 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
                 let tmp = format!("{path}.cadcraft-tmp");
                 std::fs::write(&tmp, &bytes).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
                 std::fs::rename(&tmp, path).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
-                Ok(json!({ "path": path, "bytes": bytes.len(), "layout": layout, "pages": pages }))
+                Ok(json!({ "path": path, "bytes": bytes.len(), "layout": layout, "pages": pages, "warnings": warnings }))
             }
             #[cfg(target_arch = "wasm32")]
             Err(bad(cmd, "paths are not available on the web; omit `path` to get the PDF as base64 `data`"))
         }
-        None => Ok(json!({ "data": base64_encode(&bytes), "bytes": bytes.len(), "layout": layout, "pages": pages })),
+        None => Ok(json!({ "data": base64_encode(&bytes), "bytes": bytes.len(), "layout": layout, "pages": pages, "warnings": warnings })),
     }
 }
 
@@ -1051,10 +1084,14 @@ mod tests {
         assert!(s.execute("pagesetup", &json!({"layout": "Layout1", "margins": [1, 2]})).is_err());
         assert!(s.execute("pagesetup", &json!({"layout": "Layout1", "width": 1e308, "height": 5})).is_err());
         assert!(s.execute("pagesetup", &json!({"paper": "A4"})).is_err(), "model tab needs a layout");
-        for area in ["extents", "display", "window", "limits"] {
+        for area in ["display", "limits"] {
             let e = s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": area})).unwrap_err();
             assert!(e.to_string().contains("not available yet"), "{area}: {e}");
         }
+        // Extents and a window plot now; a window area needs its window.
+        assert_eq!(s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": "extents"})).unwrap()["page"]["plotArea"], "extents");
+        let e = s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": "window"})).unwrap_err();
+        assert!(e.to_string().contains("needs a `window`"), "{e}");
         let r = s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": "Layout"})).unwrap();
         assert_eq!(r["page"]["plotArea"], "layout");
         let report = s.execute("pagesetup", &Value::Null).unwrap();
@@ -1064,9 +1101,9 @@ mod tests {
         assert_eq!((p.width_mm, p.height_mm), (300.0, 500.0));
     }
 
-    fn fake_plot(d: &Drawing, space: &Space, opts: &Value) -> std::result::Result<Vec<u8>, String> {
+    fn fake_plot(d: &Drawing, space: &Space, opts: &Value) -> std::result::Result<(Vec<u8>, Vec<String>), String> {
         let _ = d;
-        Ok(format!("%PDF-1.4 fake {space:?} {opts}").into_bytes())
+        Ok((format!("%PDF-1.4 fake {space:?} {opts}").into_bytes(), Vec::new()))
     }
 
     #[test]
@@ -1081,6 +1118,7 @@ mod tests {
             return; // another test installed hooks without a plotter first
         }
         let r = s.execute("plot", &json!({"layout": "Layout1", "paper": "A4"})).unwrap();
+        assert!(r["warnings"].is_array(), "the plot's warnings come back: {r}");
         let data = super::super::file::base64_decode(r["data"].as_str().unwrap()).unwrap();
         let text = String::from_utf8(data).unwrap();
         assert!(text.starts_with("%PDF") && text.contains("Paper(\"Layout1\")") && text.contains("A4"));

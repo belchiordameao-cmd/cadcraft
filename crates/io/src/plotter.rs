@@ -22,6 +22,13 @@ pub const MAX_PNG_PIXELS: f64 = 40.0e6;
 /// `svg`. `margins: [l, b, r, t]` (mm) bound the printable area of this plot (model space or a
 /// layout).
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
+    plot_with_warnings(d, space, opts).map(|(bytes, _)| bytes)
+}
+
+/// [`plot`], also returning the plot's warnings (a page that comes out blank because its page
+/// setup's window or its objects lie elsewhere, and what was done about it); PNG and SVG plots
+/// have none yet.
+pub fn plot_with_warnings(d: &Drawing, space: &Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>)> {
     pdf::validate_plot_offset_json(opts)?;
     if matches!(space, Space::Model)
         && opts.get("output").and_then(Value::as_str).is_some_and(|output| output.eq_ignore_ascii_case("svg"))
@@ -43,9 +50,9 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
         _ => d,
     };
     match opts.get("output").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
-        None | Some("pdf") => pdf::plot(d, space, opts),
-        Some("png") => png(d, space, opts),
-        Some("svg") => svg(d, space, opts),
+        None | Some("pdf") => pdf::plot_with_warnings(d, space, opts),
+        Some("png") => png(d, space, opts).map(|bytes| (bytes, Vec::new())),
+        Some("svg") => svg(d, space, opts).map(|bytes| (bytes, Vec::new())),
         Some(other) => Err(IoError::Unsupported(other.to_string())),
     }
 }
@@ -53,7 +60,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
 /// The sheet a plot draws on (a model-space plot's printable area inside the device margins).
 fn sheet(d: &Drawing, space: &Space, o: &PdfOptions) -> Result<(Sheet, cadcraft_doc::PageSetup)> {
     let page = pdf::page_for(d, space, o)?;
-    Ok((Sheet::from_page(&page, paper::paper_unit_mm(d)), page))
+    Ok((Sheet::from_page(&page, paper::page_unit_mm(d, &page)), page))
 }
 
 /// Paper units per drawing unit fitting `b` into the printable area; with `fit: false`, the

@@ -512,8 +512,9 @@ fn pdf_layout_one_to_one_with_viewport() {
     let content = check_pdf(&bytes);
     // ANSI A landscape (inches → points).
     assert_eq!(media_box(&bytes), (792.0, 612.0));
-    // Viewport border at 1:1: x from 1in to 9in = 72pt..648pt.
-    assert!(content.contains("72 72 m") || content.contains("72 72 l"), "{content}");
+    // Viewport border at 1:1: paper (1 in, 1 in) lies 1 in from the printable corner, which sits
+    // 0.25 in from the sheet's edge: 90 pt from the page corner.
+    assert!(content.contains("90 90 m") || content.contains("90 90 l"), "{content}");
     // Lineweights on: default 0.25 mm = 0.709 pt.
     assert!(content.contains("0.709 w"));
     let off = plot(&d, &paper, &serde_json::json!({"lineweights": false})).unwrap();
@@ -700,6 +701,28 @@ fn join(p: &[(String, String)]) -> String {
 }
 
 #[test]
+fn viewport_view_center_is_relative_to_the_view_target() {
+    let (d, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let at = p[r.clone()].iter().position(|(c, _)| c == "45").unwrap() + r.start + 1;
+    let mut q: Vec<(String, String)> = p[..at].to_vec();
+    q.extend([("17".into(), "1000.0".into()), ("27".into(), "-250.5".into()), ("37".into(), "0.0".into())]);
+    q.extend(p[at..].iter().cloned());
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    let center = |d: &Drawing| {
+        d.layouts
+            .iter()
+            .flat_map(|l| l.entities.iter())
+            .find_map(|e| match &e.kind {
+                EntityKind::Viewport(v) if v.id == 2 => Some(v.view_center),
+                _ => None,
+            })
+            .expect("viewport")
+    };
+    assert!(center(&back).near(center(&d) + Vec2::new(1000.0, -250.5), 1e-9));
+}
+
+#[test]
 fn viewport_frozen_layers_written_as_341_handles() {
     let (_, p) = frozen_vp_dxf();
     let r = vp_record(&p, "2");
@@ -721,6 +744,19 @@ fn viewport_frozen_layers_read_from_341_without_xdata() {
     let mut head = p[r.start..x].to_vec();
     head.push(("341".into(), "FFFFF".into()));
     q.extend(head);
+    q.extend(p[r.end..].iter().cloned());
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
+}
+
+#[test]
+fn viewport_frozen_layers_read_from_331_as_autocad_2004_and_later_write_them() {
+    // R2000–R2002 list a viewport's frozen layers in group 341; R2004 and later (and ezdxf) in 331.
+    let (_, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let x = p[r.clone()].iter().position(|(c, _)| c == "1001").unwrap() + r.start;
+    let mut q: Vec<(String, String)> = p[..r.start].to_vec();
+    q.extend(p[r.start..x].iter().map(|(c, v)| (if c == "341" { "331".into() } else { c.clone() }, v.clone())));
     q.extend(p[r.end..].iter().cloned());
     let back = read_dxf(join(&q).as_bytes()).unwrap();
     assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
@@ -2192,6 +2228,241 @@ fn kept_xrecord_application_group_roundtrips_as_read() {
     assert!(!out.contains("291\n2"), "no handle may be written under a bool code");
 }
 
+// ---------- named plot styles ----------
+
+/// A named-plot-style drawing keeps every plot style name its ACAD_PLOTSTYLENAME dictionary
+/// declares, used or not: a file written has a placeholder for each (two were lost from a real
+/// drawing, whose styles nothing used yet).
+#[test]
+fn declared_plot_style_names_are_kept_whether_used_or_not() {
+    let dxf = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$PSTYLEMODE\n290\n0\n0\nENDSEC\n\
+0\nSECTION\n2\nENTITIES\n0\nLINE\n5\n100\n100\nAcDbEntity\n8\n0\n390\n31\n100\nAcDbLine\n10\n0\n20\n0\n30\n0\n11\n1\n21\n1\n31\n0\n0\nENDSEC\n\
+0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_PLOTSTYLENAME\n350\nE\n\
+0\nACDBDICTIONARYWDFLT\n5\nE\n330\nC\n100\nAcDbDictionary\n281\n1\n3\nNormal\n350\nF\n3\nStyle A\n350\n31\n3\nStyle B\n350\n32\n100\nAcDbDictionaryWithDefault\n340\nF\n\
+0\nACDBPLACEHOLDER\n5\nF\n330\nE\n0\nACDBPLACEHOLDER\n5\n31\n330\nE\n0\nACDBPLACEHOLDER\n5\n32\n330\nE\n0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(dxf.as_bytes()).unwrap();
+    assert_eq!(d.plot_style_names, ["Style A", "Style B"]);
+    assert_eq!(d.model.iter().next().map(|e| e.common.plot_style.clone()).as_deref(), Some("Style A"));
+    let out = write_dxf(&d);
+    assert_eq!(dxf_records(&out, "ACDBPLACEHOLDER"), 3);
+    assert_eq!((dxf_groups(&out, "3", "Normal"), dxf_groups(&out, "3", "Style A"), dxf_groups(&out, "3", "Style B")), (1, 1, 1));
+    // And again from the file written: nothing drifts.
+    let again = write_dxf(&read_dxf(out.as_bytes()).unwrap());
+    assert_eq!(dxf_records(&again, "ACDBPLACEHOLDER"), 3);
+    // A drawing made here declares none: Normal alone, as before.
+    let fresh = write_dxf(&Drawing::new_metric());
+    assert_eq!(dxf_records(&fresh, "ACDBPLACEHOLDER"), 1);
+}
+
+// ---------- DGN line-style objects and the raw keeper's cost ----------
+
+/// A DXF whose named object dictionary owns a DGN line-style component dictionary of `n`
+/// internal components (the shape a DGN import leaves behind): the first owns an extension
+/// dictionary with an XRECORD; the second links to one whose own owner group is null (as a
+/// DWG reader may leave it); a DGN linetype's extension dictionary holds the third and nothing
+/// else; plus another dictionary holding one XRECORD and the CLASS record of the components.
+/// `header` adds a HEADER section (the DWG bridge wants one).
+fn dgn_line_style_dxf(n: usize, header: bool) -> String {
+    let mut s = String::new();
+    if header {
+        s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFFF\n0\nENDSEC\n";
+    }
+    s += "0\nSECTION\n2\nCLASSES\n0\nCLASS\n1\nLSINTERNALCOMPONENT\n2\nAcDbLSInternalComponent\n3\nObjectDBX Classes\n90\n0\n91\n1\n280\n0\n281\n0\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n5\n5\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nLTYPE\n5\n50\n102\n{ACAD_XDICTIONARY\n360\n207\n102\n}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\nDGN_A\n70\n0\n3\nfrom DGN\n72\n65\n73\n0\n40\n0.0\n\
+0\nENDTAB\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n\
+3\nACAD_DGNLINESTYLECOMP\n350\n200\n3\nMY_DATA\n350\n201\n\
+0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n";
+    for i in 0..n {
+        s += &format!("3\nLS_{i}\n360\n{:X}\n", 0x1000 + i);
+    }
+    s += "0\nDICTIONARY\n5\n201\n330\nC\n100\nAcDbDictionary\n281\n1\n3\nK\n360\n202\n\
+0\nXRECORD\n5\n202\n330\n201\n100\nAcDbXrecord\n280\n1\n1\nkept\n\
+0\nDICTIONARY\n5\n203\n330\n1000\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nOF_A_COMPONENT\n360\n204\n\
+0\nXRECORD\n5\n204\n330\n203\n100\nAcDbXrecord\n280\n1\n1\nof a component\n\
+0\nDICTIONARY\n5\n205\n330\n0\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nOF_ANOTHER\n360\n206\n\
+0\nXRECORD\n5\n206\n330\n205\n100\nAcDbXrecord\n280\n1\n1\nof another\n\
+0\nDICTIONARY\n5\n207\n330\n50\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nACAD_DGNLS\n360\n1002\n";
+    for i in 0..n {
+        let xdict = match i {
+            0 => "102\n{ACAD_XDICTIONARY\n360\n203\n102\n}\n",
+            1 => "102\n{ACAD_XDICTIONARY\n360\n205\n102\n}\n",
+            _ => "",
+        };
+        s += &format!(
+            "0\nLSINTERNALCOMPONENT\n5\n{:X}\n{xdict}330\n200\n100\nAcDbLSInternalComponent\n1\nC{i}\n90\n2\n91\n1\n310\n00\n40\n1.0\n280\n0\n\
+             290\n0\n291\n0\n92\n0\n41\n0.0\n42\n0.0\n281\n0\n93\n0\n96\n1\n97\n0\n297\n0\n98\n0\n",
+            0x1000 + i
+        );
+    }
+    s += "0\nENDSEC\n0\nEOF\n";
+    s
+}
+
+/// Records of `kind` in DXF text.
+fn dxf_records(text: &str, kind: &str) -> usize {
+    dxf_groups(text, "0", kind)
+}
+
+/// Groups `code` / `value` in DXF text.
+fn dxf_groups(text: &str, code: &str, value: &str) -> usize {
+    text.lines().map(str::trim).collect::<Vec<_>>().chunks(2).filter(|p| *p == [code, value]).count()
+}
+
+/// DGN line-style objects (`LS*`) are kept raw up to `MAX_DGN_LINE_STYLE_OBJECTS` of them and
+/// written back; a file with more opens without any of them, says so in a note, and is saved
+/// without them and without the dictionary entries that named them.
+#[test]
+fn dgn_line_style_objects_are_kept_up_to_the_cap_and_left_out_beyond_it() {
+    let max = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS;
+    let d = read_dxf(dgn_line_style_dxf(max, false).as_bytes()).unwrap();
+    assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
+    let kept = |d: &Drawing, kind: &str| d.foreign.objects.iter().filter(|o| o.kind == kind).count();
+    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max, 4, 2));
+    let out = write_dxf(&d);
+    assert_eq!(dxf_records(&out, "LSINTERNALCOMPONENT"), max);
+    assert_eq!((dxf_groups(&out, "3", "LS_0"), dxf_groups(&out, "1", "of a component"), dxf_groups(&out, "1", "LSINTERNALCOMPONENT")), (1, 1, 1));
+
+    let d = read_dxf(dgn_line_style_dxf(max + 1, false).as_bytes()).unwrap();
+    assert_eq!(d.read_notes.len(), 1, "{:?}", d.read_notes);
+    let note = &d.read_notes[0];
+    let n = max + 1;
+    assert_eq!(
+        note,
+        &format!(
+            "{n} DGN line-style objects were left out ({n} LSINTERNALCOMPONENT), with 5 objects that go with them (3 DICTIONARY, 2 XRECORD; \
+             1 LTYPE loses its extension dictionary) and the 1 CLASS record of their types: a drawing keeps at most {max} unless opened keeping every object. \
+             The drawing opens and plots without them; a file saved from it has no DGN line styles (their linetypes stay)."
+        )
+    );
+    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (0, 2, 1), "the rest is kept as before");
+    let out = write_dxf(&d);
+    assert_eq!((dxf_records(&out, "LSINTERNALCOMPONENT"), dxf_groups(&out, "1", "LSINTERNALCOMPONENT")), (0, 0));
+    assert_eq!(dxf_groups(&out, "3", "LS_0"), 0, "an entry whose object is gone is dropped");
+    assert_eq!((dxf_groups(&out, "3", "ACAD_DGNLINESTYLECOMP"), dxf_groups(&out, "1", "kept"), dxf_groups(&out, "1", "of a component")), (1, 1, 0));
+
+    // Opened keeping every object, the file keeps them all, whatever their number.
+    let d = crate::read_with(dgn_line_style_dxf(max + 1, false).as_bytes(), "dgn.dxf", &crate::ReadOptions { keep_all: true }).unwrap();
+    assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
+    assert_eq!((kept(&d, "LSINTERNALCOMPONENT"), kept(&d, "DICTIONARY"), kept(&d, "XRECORD")), (max + 1, 4, 2));
+    assert_eq!(dxf_records(&write_dxf(&d), "LSINTERNALCOMPONENT"), max + 1);
+}
+
+/// The same through a DWG: the objects go before the DXF text is written, so neither the text
+/// nor the groups carry them, and the note travels with the drawing's other DWG notes.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn dwg_with_more_dgn_line_styles_than_kept_opens_without_them() {
+    let max = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS;
+    let dwg = cadcraft_dwg::dxf_to_dwg(dgn_line_style_dxf(max + 1, true).as_bytes()).unwrap();
+    let (dxf, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::DEFAULT).unwrap();
+    assert!(notes.is_empty(), "the reader of the text makes the note: {notes:?}");
+    let left = probe.dgn_line_styles.clone().unwrap_or_default();
+    assert_eq!(left.objects, vec![("LSINTERNALCOMPONENT".to_string(), max + 1)]);
+    // The first component's extension dictionary and its xrecord go by owner; the second's,
+    // whose own owner group is null, by the link from the component; the linetype's, by being
+    // left with no entry but the third component.
+    assert_eq!(left.with_them, vec![("DICTIONARY".to_string(), 3), ("XRECORD".to_string(), 2)], "{left:?}");
+    assert_eq!(left.emptied_of, vec!["50".to_string()], "the linetype whose extension dictionary held only a component");
+    assert!(["1000", "203", "204", "205", "206", "207"].iter().all(|h| left.handles.contains(*h)), "{:?}", left.handles.len());
+    let text = String::from_utf8_lossy(&dxf);
+    assert_eq!(
+        (dxf_records(&text, "LSINTERNALCOMPONENT"), dxf_groups(&text, "1", "of a component"), dxf_groups(&text, "1", "of another")),
+        (0, 0, 0)
+    );
+    let d = read(&dwg, "dgn.dwg").unwrap();
+    let note = d.read_notes.iter().find(|n| n.contains("DGN line-style objects were left out")).unwrap_or_else(|| panic!("{:?}", d.read_notes));
+    assert!(note.contains(", with 5 objects that go with them (3 DICTIONARY, 2 XRECORD; 1 LTYPE loses its extension dictionary)"), "{note}");
+    assert!(d.foreign.objects.iter().all(|o| o.kind != "LSINTERNALCOMPONENT"));
+    // Keeping every object, they come through the DWG.
+    let (_, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::KEEPING_ALL).unwrap();
+    assert!(probe.dgn_line_styles.is_none() && notes.is_empty(), "{notes:?}");
+    let d = crate::read_all(&dwg, "dgn.dwg").unwrap();
+    assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), max + 1);
+}
+
+/// What the DWG bridge dropped with the line-style objects is counted by handle, not by the
+/// text: acadrust writes a dictionary whose owner is gone as owned by the root dictionary, and
+/// a dictionary without the entries that named gone objects, so the text alone would show an
+/// orphan under the root and an empty extension dictionary, and nothing would be said. The
+/// text's own evidence counts too: an extension dictionary whose entries all name a gone
+/// handle goes with them.
+#[test]
+fn objects_the_dwg_bridge_dropped_with_the_line_styles_are_counted_by_handle() {
+    let dxf = "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n5\n5\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nLTYPE\n5\n50\n102\n{ACAD_XDICTIONARY\n360\n500\n102\n}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\nDGN_A\n70\n0\n3\n\n72\n65\n73\n0\n40\n0.0\n\
+0\nENDTAB\n0\nENDSEC\n\
+0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_DGNLINESTYLECOMP\n350\n200\n\
+0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n\
+0\nDICTIONARY\n5\n300\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nK\n360\n301\n\
+0\nXRECORD\n5\n301\n330\n300\n100\nAcDbXrecord\n280\n1\n1\nwas a definition's\n\
+0\nDICTIONARY\n5\n400\n330\n1234\n100\nAcDbDictionary\n280\n1\n281\n1\n\
+0\nDICTIONARY\n5\n500\n330\n50\n100\nAcDbDictionary\n280\n1\n281\n1\n3\nACAD_DGNLS\n360\n1234\n\
+0\nENDSEC\n0\nEOF\n";
+    let (secs, outside, _) = crate::dxf_sections_left_out(dxf.as_bytes(), &crate::ReadOptions::default()).unwrap();
+    let left_out = crate::LeftOut {
+        dgn_line_styles: vec![("LSDEFINITION".into(), 14)],
+        handles: ["1234".to_string(), "300".to_string()].into_iter().collect(),
+        with_them: vec![("DICTIONARY".into(), 1)],
+        emptied_of: vec!["50".into()],
+        cap: 10_000,
+    };
+    let d = crate::read_dxf_sections_left_out(secs, outside, &left_out, &mut |_| {}).unwrap();
+    assert_eq!(d.read_notes.len(), 1, "{:?}", d.read_notes);
+    // The bridge's one; the dictionary the text shows under the root (handle listed) and its
+    // xrecord; the dictionary whose owner is a listed handle; the linetype's extension
+    // dictionary left with no entry but a listed handle.
+    assert!(
+        d.read_notes[0].starts_with(
+            "14 DGN line-style objects were left out (14 LSDEFINITION), with 5 objects that go with them (4 DICTIONARY, 1 XRECORD; 2 LTYPE lose their extension dictionaries)"
+        ),
+        "{}",
+        d.read_notes[0]
+    );
+    assert!(d.foreign.objects.iter().all(|o| !matches!(o.handle.hex().as_str(), "300" | "301" | "400" | "500")), "{:?}", d.foreign.objects);
+    assert!(d.foreign.objects.iter().any(|o| o.handle.hex() == "200"), "the root's own entry stays");
+}
+
+/// Building the drawing reports its phases in order, first to last.
+#[test]
+fn reading_phases_are_traced_in_order() {
+    let (secs, outside, left_out) = crate::dxf_sections_left_out(dgn_line_style_dxf(3, false).as_bytes(), &crate::ReadOptions::default()).unwrap();
+    assert!(left_out.is_empty());
+    let mut seen: Vec<&'static str> = Vec::new();
+    let d = crate::read_dxf_sections_left_out(secs, outside, &left_out, &mut |p| seen.push(p)).unwrap();
+    assert_eq!(seen.first().copied(), Some("plot style names"));
+    assert_eq!(seen.last().copied(), Some("done"));
+    let at = |p: &str| seen.iter().position(|s| *s == p).unwrap_or_else(|| panic!("{p} not in {seen:?}"));
+    assert!(at("objects") < at("layouts and blocks") && at("layouts and blocks") < at("foreign data"));
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), 3);
+}
+
+/// Every object under one large dictionary is kept and written back. (The raw keeper read
+/// the dictionary's head again for each object it owned: with a dictionary of hundreds of
+/// thousands of entries that was quadratic, and a real file took minutes here.)
+#[test]
+fn objects_under_one_large_dictionary_are_all_kept() {
+    let n = 3000;
+    let mut s = String::from(
+        "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nMY_APP\n350\n200\n\
+         0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n",
+    );
+    for i in 0..n {
+        s += &format!("3\nR{i}\n360\n{:X}\n", 0x1000 + i);
+    }
+    for i in 0..n {
+        s += &format!("0\nXRECORD\n5\n{:X}\n330\n200\n100\nAcDbXrecord\n280\n1\n1\nv{i}\n", 0x1000 + i);
+    }
+    s += "0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(s.as_bytes()).unwrap();
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "XRECORD").count(), n);
+    let out = write_dxf(&d);
+    assert!(dxf_records(&out, "XRECORD") >= n, "{}", dxf_records(&out, "XRECORD"));
+    assert_eq!((dxf_groups(&out, "3", "R2999"), dxf_groups(&out, "1", "v2999")), (1, 1));
+}
+
 // ---------- plot transparency ----------
 
 /// A black line under a red solid at `percent` transparency (drawn after it, so on top).
@@ -2372,4 +2643,433 @@ fn foreign_table_reads_cell_text_height_and_keeps_style_scale() {
     let t2 = first(&back, |k| if let EntityKind::Table(x) = k { Some(x.clone()) } else { None });
     assert_eq!(t2.cells[0][0].text_height, Some(150.0));
     assert_eq!(t2.cells[0][1].text_height, None);
+}
+
+/// The `x y m` / `x y l` path points of an uncompressed PDF content stream.
+fn path_points(content: &str) -> Vec<Vec2> {
+    let toks: Vec<&str> = content.split_whitespace().collect();
+    toks.windows(3).filter(|w| w[2] == "m" || w[2] == "l").filter_map(|w| Some(Vec2::new(w[0].parse().ok()?, w[1].parse().ok()?))).collect()
+}
+
+#[test]
+fn autocad_style_viewport_survives_dwg_view_target_frozen_331_no_xdata() {
+    // What AutoCAD 2004+ writes: 12/22 relative to the view target 17/27/37, frozen layers as
+    // 331 layer handles, no CADCraft xdata. Through DWG (acadrust) and back, the reader recovers
+    // the model point at the viewport's centre and the frozen layer names.
+    let (d, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let mut rec: Vec<(String, String)> =
+        p[r.clone()].iter().take_while(|(c, _)| c != "1001").map(|(c, v)| (if c == "341" { "331".into() } else { c.clone() }, v.clone())).collect();
+    let at = rec.iter().position(|(c, _)| c == "45").unwrap() + 1;
+    rec.splice(at..at, [("17".to_string(), "1000.0".to_string()), ("27".to_string(), "-250.5".to_string()), ("37".to_string(), "0.0".to_string())]);
+    let mut q: Vec<(String, String)> = p[..r.start].to_vec();
+    q.extend(rec);
+    q.extend(p[r.end..].iter().cloned());
+    let dwg = cadcraft_dwg::dxf_to_dwg(join(&q).as_bytes()).unwrap();
+    let back = read(&dwg, "t.dwg").unwrap();
+    let center = |d: &Drawing| {
+        d.layouts
+            .iter()
+            .flat_map(|l| l.entities.iter())
+            .find_map(|e| match &e.kind {
+                EntityKind::Viewport(v) if v.id == 2 => Some(v.view_center),
+                _ => None,
+            })
+            .expect("viewport")
+    };
+    assert!(center(&back).near(center(&d) + Vec2::new(1000.0, -250.5), 1e-6), "{:?} vs {:?}", center(&back), center(&d));
+    assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
+}
+
+#[test]
+fn viewport_status_68_zero_reads_as_off() {
+    // The DXF Reference: status 68 = 0 is a viewport that is off, whatever the flags say.
+    let (_, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let mut q = p.clone();
+    let mut seen = false;
+    for t in &mut q[r] {
+        if t.0 == "68" {
+            t.1 = "0".into();
+            seen = true;
+        }
+    }
+    assert!(seen, "the writer gives viewports a status 68");
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    let on = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .find_map(|e| match &e.kind {
+            EntityKind::Viewport(v) if v.id == 2 => Some(v.on),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!on);
+}
+
+#[test]
+fn pdf_layout_plot_area_extents_fits_and_centres_the_sheet_contents() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "extents".into();
+        p.scale_to_fit = true;
+        p.center = true;
+    }
+    // A frame larger than the paper: 320 x 230 from (-10, -10).
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(-10.0, -10.0), Vec2::new(310.0, -10.0), Vec2::new(310.0, 220.0), Vec2::new(-10.0, 220.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    let k = 72.0 / 25.4;
+    let extent = |content: &str| {
+        let pts = path_points(content);
+        assert!(pts.len() >= 4, "{content}");
+        pts.iter().fold(Bounds2::EMPTY, |mut b, p| {
+            b.add(*p);
+            b
+        })
+    };
+    // Scaled to fit and centred: scale 200/230 (the printable area is 287 x 200), centred on it.
+    let bytes = plot(&d, &paper, &serde_json::json!({})).unwrap();
+    let (w, h) = media_box(&bytes);
+    assert!((w - 297.0 * k).abs() < 0.01 && (h - 210.0 * k).abs() < 0.01, "A4 landscape: {w} x {h}");
+    let b = extent(&check_pdf(&bytes));
+    let s = 200.0 / 230.0;
+    let (cx, cy) = ((5.0 + 143.5) * k, (5.0 + 100.0) * k);
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+    assert!(near(b.min.x, cx - 160.0 * s * k) && near(b.max.x, cx + 160.0 * s * k), "{b:?}");
+    assert!(near(b.min.y, cy - 115.0 * s * k) && near(b.max.y, cy + 115.0 * s * k), "{b:?}");
+    // At the plot scale (1:1) from the plot origin instead: the frame's corner (-10, -10) lands
+    // at the printable corner (5 mm from the sheet's) and the frame overflows the sheet.
+    d.layouts[0].page.scale_to_fit = false;
+    d.layouts[0].page.center = false;
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!(near(b.min.x, 5.0 * k) && near(b.min.y, 5.0 * k) && near(b.max.x, 325.0 * k) && near(b.max.y, 235.0 * k), "{b:?}");
+    // Plot area `layout`: paper (0, 0) at the printable corner, so the frame starts 5 mm outside it.
+    d.layouts[0].page.plot_area = "layout".into();
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!(near(b.min.x, -5.0 * k) && near(b.min.y, -5.0 * k) && near(b.max.x, 315.0 * k) && near(b.max.y, 225.0 * k), "{b:?}");
+}
+
+/// The pair range of the LAYOUT record named `name`.
+fn layout_record(p: &[(String, String)], name: &str) -> std::ops::Range<usize> {
+    let starts: Vec<usize> = (0..p.len()).filter(|&i| p[i].0 == "0").collect();
+    for w in starts.windows(2) {
+        let r = w[0]..w[1];
+        if p[w[0]].1 == "LAYOUT" && p[r.clone()].iter().any(|(c, v)| c == "1" && v == name) {
+            return r;
+        }
+    }
+    panic!("no LAYOUT {name}");
+}
+
+fn pairs_of(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.chunks(2).map(|c| (c[0].trim().to_string(), c.get(1).copied().unwrap_or("").to_string())).collect()
+}
+
+/// The `x y w h re` rectangles of an uncompressed PDF content stream.
+fn clip_rects(content: &str) -> Vec<[f64; 4]> {
+    let toks: Vec<&str> = content.split_whitespace().collect();
+    toks.windows(5)
+        .filter(|w| w[4] == "re")
+        .filter_map(|w| Some([w[0].parse().ok()?, w[1].parse().ok()?, w[2].parse().ok()?, w[3].parse().ok()?]))
+        .collect()
+}
+
+#[test]
+fn page_setup_paper_units_follow_the_plot_settings() {
+    // A metric drawing says millimetres (group 72 = 1) for its layouts; read back, the page
+    // setup keeps the drawing's units (its default).
+    let d = Drawing::new_metric();
+    let name = d.layouts[0].name.clone();
+    let mut p = pairs_of(&write_dxf(&d));
+    let r = layout_record(&p, &name);
+    assert!(p[r.clone()].contains(&("72".to_string(), "1".to_string())), "metric layouts plot in millimetres");
+    let back = read_dxf(join(&p).as_bytes()).unwrap();
+    assert_eq!(back.layout(&name).unwrap().page.paper_unit_mm, 0.0);
+    // The same layout plotting in inches (72 = 0): paper space is in inches, whatever
+    // $MEASUREMENT says. The sheet keeps its millimetre size, in inches.
+    for t in &mut p[r] {
+        if t.0 == "72" {
+            t.1 = "0".into();
+        }
+    }
+    let back = read_dxf(join(&p).as_bytes()).unwrap();
+    let page = back.layout(&name).unwrap().page.clone();
+    assert_eq!(page.paper_unit_mm, 25.4);
+    let sheet = cadcraft_render::paper::sheet(&back, &name).unwrap();
+    assert_eq!(sheet.unit_mm, 25.4);
+    let (w, h) = (page.width_mm.max(page.height_mm), page.width_mm.min(page.height_mm));
+    assert!((sheet.size.x - w / 25.4).abs() < 1e-9 && (sheet.size.y - h / 25.4).abs() < 1e-9, "{:?}", sheet.size);
+    // And it is written back as inches.
+    let again = pairs_of(&write_dxf(&back));
+    let r = layout_record(&again, &name);
+    assert!(again[r].contains(&("72".to_string(), "0".to_string())));
+    // A plot of it: a viewport drawn in inches at (1,1)..(9,7) spans 8 in = 576 pt, not 8 mm.
+    let mut back = back;
+    let paper = Space::Paper(name.clone());
+    back.add(
+        &paper,
+        Common::default(),
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id: 2,
+            ..Viewport::default()
+        }),
+    )
+    .unwrap();
+    let content = check_pdf(&plot(&back, &paper, &serde_json::json!({})).unwrap());
+    let pts = path_points(&content);
+    let (minx, maxx) = pts.iter().fold((f64::MAX, f64::MIN), |(a, b), q| (a.min(q.x), b.max(q.x)));
+    assert!((maxx - minx - 576.0).abs() < 0.05, "viewport border {minx}..{maxx} pt");
+}
+
+#[test]
+fn pdf_layout_plot_area_window_plots_the_window_to_fit() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    let window = Bounds2::new(Vec2::new(50.0, 50.0), Vec2::new(150.0, 100.0));
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "window".into();
+        p.window = Some(window);
+        p.scale_to_fit = true;
+        p.center = false;
+    }
+    // A frame around the sheet and a line inside the window.
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(0.0, 0.0), Vec2::new(287.0, 0.0), Vec2::new(287.0, 200.0), Vec2::new(0.0, 200.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    d.add(&paper, Common::default(), EntityKind::Line(Line { a: Vec3::new(60.0, 60.0, 0.0), b: Vec3::new(140.0, 90.0, 0.0) })).unwrap();
+    // The window survives a DXF round trip (groups 48/49 and 140/141).
+    let back = read_dxf(write_dxf(&d).as_bytes()).unwrap();
+    assert_eq!(back.layouts[0].page.window, Some(window));
+    assert_eq!(back.layouts[0].page.plot_area, "window");
+    // Scale to fit the 100 x 50 window into the 287 x 200 printable area: 2.87, from the
+    // printable corner (5 mm from the sheet's). The line's ends land accordingly.
+    let k = 72.0 / 25.4;
+    let s: f64 = 2.87;
+    let content = check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap());
+    let pts = path_points(&content);
+    let near = |p: &Vec2, x: f64, y: f64| (p.x - x).abs() < 0.05 && (p.y - y).abs() < 0.05;
+    assert!(pts.iter().any(|p| near(p, (5.0 + 10.0 * s) * k, (5.0 + 10.0 * s) * k)), "line start: {pts:?}");
+    assert!(pts.iter().any(|p| near(p, (5.0 + 90.0 * s) * k, (5.0 + 40.0 * s) * k)), "line end");
+    // The plot is clipped to the window: its page rectangle (5..292 x 5..148.5 mm).
+    let rects = clip_rects(&content);
+    let want = [5.0 * k, 5.0 * k, 287.0 * k, 143.5 * k];
+    assert!(rects.iter().any(|r| r.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.05)), "window clip: {rects:?}");
+}
+
+#[test]
+fn pdf_layout_fit_option_fits_the_contents_whatever_the_page_setup_says() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "layout".into();
+    }
+    // A frame larger than the paper, in a layout whose page setup plots the sheet 1:1.
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(-10.0, -10.0), Vec2::new(310.0, -10.0), Vec2::new(310.0, 220.0), Vec2::new(-10.0, 220.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    let extent = |content: &str| {
+        path_points(content).iter().fold(Bounds2::EMPTY, |mut b, p| {
+            b.add(*p);
+            b
+        })
+    };
+    let k = 72.0 / 25.4;
+    // As the page setup says: the sheet, 1:1, the frame overflowing it.
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!((b.max.x - 315.0 * k).abs() < 0.05, "{b:?}");
+    // With `fit`: the frame scaled by 200/230 and centred on the printable area.
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({"fit": true})).unwrap()));
+    let s = 200.0 / 230.0;
+    let (cx, cy) = ((5.0 + 143.5) * k, (5.0 + 100.0) * k);
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+    assert!(near(b.min.x, cx - 160.0 * s * k) && near(b.max.x, cx + 160.0 * s * k), "{b:?}");
+    assert!(near(b.min.y, cy - 115.0 * s * k) && near(b.max.y, cy + 115.0 * s * k), "{b:?}");
+}
+
+#[test]
+fn large_pdf_streams_compress_at_the_fast_level_and_inflate_back() {
+    // 9 MB of content-stream-like text: compressed at the fast level, still a valid Flate stream.
+    let line = b"123.456 789.012 m 345.678 901.234 l S\n";
+    let data: Vec<u8> = line.iter().copied().cycle().take(9 << 20).collect();
+    let body = crate::pdf::stream_for_test(&data, true);
+    let start = body.windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+    let end = body.len() - b"\nendstream".len();
+    let back = miniz_oxide::inflate::decompress_to_vec_zlib(&body[start..end]).unwrap();
+    assert_eq!(back, data);
+    assert!(body.len() < data.len() / 10, "{} bytes", body.len());
+}
+
+/// A metric A4 landscape layout (5 mm margins) with a frame on the sheet.
+fn framed_layout() -> (Drawing, Space) {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+    }
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(0.0, 0.0), Vec2::new(287.0, 0.0), Vec2::new(287.0, 200.0), Vec2::new(0.0, 200.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    (d, paper)
+}
+
+#[test]
+fn pdf_layout_window_outside_the_drawing_warns_and_fit_plots_the_extents_instead() {
+    let (mut d, paper) = framed_layout();
+    {
+        let p = &mut d.layouts[0].page;
+        p.plot_area = "window".into();
+        p.window = Some(Bounds2::new(Vec2::new(1000.0, 1000.0), Vec2::new(1100.0, 1050.0)));
+        p.scale_to_fit = true;
+    }
+    // As the page setup says: the window is plotted, blank, with a warning.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({})).unwrap();
+    let content = check_pdf(&bytes);
+    assert!(
+        path_points(&content).iter().all(|p| p.x > 2000.0 || p.x < -1000.0 || p.y > 2000.0 || p.y < -1000.0),
+        "nothing of the frame lands on the page"
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("window") && warnings[0].contains("lies outside") && warnings[0].contains("blank"), "{}", warnings[0]);
+    // With `fit`: the extents are plotted instead, fitted and centred, and the warning says so.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({"fit": true})).unwrap();
+    let b = path_points(&check_pdf(&bytes)).iter().fold(Bounds2::EMPTY, |mut b, p| {
+        b.add(*p);
+        b
+    });
+    // The 287 x 200 frame fits the printable area exactly: scale 1, from 5 mm to 292 mm.
+    let k = 72.0 / 25.4;
+    assert!((b.min.x - 5.0 * k).abs() < 0.05 && (b.max.x - 292.0 * k).abs() < 0.05, "{b:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("extents were plotted instead"), "{}", warnings[0]);
+}
+
+#[test]
+fn pdf_layout_objects_outside_the_sheet_warn() {
+    let (mut d, paper) = framed_layout();
+    // Move the frame far from the sheet: plot area `layout` keeps the sheet, which is blank.
+    for e in d.layouts[0].entities.iter().map(|e| e.handle).collect::<Vec<_>>() {
+        let _ = d.modify_entity(e, |e| {
+            if let EntityKind::LwPolyline(p) = &mut e.kind {
+                for v in &mut p.vertices {
+                    v.p += Vec2::new(5000.0, 5000.0);
+                }
+            }
+        });
+    }
+    let (_, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({})).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("lie outside its sheet") && warnings[0].contains("blank"), "{}", warnings[0]);
+    // With `fit` they are plotted, without a warning.
+    let (bytes, warnings) = plot_with_warnings(&d, &paper, &serde_json::json!({"fit": true})).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(path_points(&check_pdf(&bytes)).iter().all(|p| p.x >= 14.0 && p.x <= 828.0), "fitted onto the page");
+    // Objects on the sheet: no warning.
+    let (_, warnings) = plot_with_warnings(&framed_layout().0, &paper, &serde_json::json!({})).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// A block reference repeated 2x2 at spacing 5 with one multiline attribute: the attribute's
+/// text at (0, 2), its embedded multiline text at the same point.
+fn repeated_multiline_attrib() -> Drawing {
+    let mut s = String::new();
+    s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFF\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nBLOCK_RECORD\n5\n1\n330\n0\n100\nAcDbSymbolTable\n70\n1\n\
+0\nBLOCK_RECORD\n5\n100\n330\n1\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\nTAGBLK\n0\nENDTAB\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n5\n102\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockBegin\n2\nTAGBLK\n70\n2\n10\n0\n20\n0\n30\n0\n3\nTAGBLK\n1\n\n\
+0\nLINE\n5\n104\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbLine\n10\n0\n20\n0\n30\n0\n11\n10\n21\n0\n31\n0\n\
+0\nATTDEF\n5\n105\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbText\n10\n0\n20\n2\n30\n0\n40\n2.5\n1\nX\n100\nAcDbAttributeDefinition\n3\nTag:\n2\nTAG1\n70\n0\n\
+0\nENDBLK\n5\n103\n330\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockEnd\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nENTITIES\n\
+0\nINSERT\n5\n400\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockReference\n66\n1\n2\nTAGBLK\n10\n0\n20\n0\n30\n0\n70\n2\n71\n2\n44\n5\n45\n5\n\
+0\nATTRIB\n5\n401\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbText\n10\n0\n20\n2\n30\n0\n40\n2.5\n1\nVAL\n100\nAcDbAttribute\n2\nTAG1\n70\n0\n\
+71\n2\n72\n1\n11\n0\n21\n2\n31\n0\n101\nEmbedded Object\n10\n0\n20\n2\n30\n0\n40\n2.5\n41\n20\n46\n0\n71\n1\n72\n5\n1\nVAL\\PLINE2\n7\nStandard\n73\n1\n44\n1\n\
+0\nSEQEND\n5\n402\n330\n1F\n100\nAcDbEntity\n8\n0\n0\nENDSEC\n0\nEOF\n";
+    read_dxf(s.as_bytes()).unwrap()
+}
+
+/// The DWG bridge's text has a repeated reference with attributes as one reference per copy:
+/// a multiline attribute's embedded text moves with the copy too (it has an insertion point of
+/// its own, which the copies left at the first copy's).
+#[test]
+fn dwg_bridge_copies_move_a_multiline_attribute_text_along() {
+    let d = repeated_multiline_attrib();
+    let (text, notes) = dxf_write::dwg_bridge(&d, Version::R2013);
+    assert!(notes.is_empty(), "{notes:?}");
+    let tags = cadcraft_dxf::parse_ascii(&text).unwrap();
+    let mut seen = Vec::new();
+    for (kind, rec) in cadcraft_dxf::record_slices(&tags) {
+        if kind != "ATTRIB" {
+            continue;
+        }
+        let marker = rec.iter().position(|t| t.code == 101).expect("a multiline attribute keeps its embedded text");
+        let point = |tags: &[cadcraft_dxf::Tag], code: i32| tags.iter().find(|t| t.code == code).map(|t| t.value.as_f64()).unwrap_or(f64::NAN);
+        let (own, embedded) = (&rec[..marker], &rec[marker + 1..]);
+        let text_at = (point(own, 10), point(own, 20));
+        let embedded_at = (point(embedded, 10), point(embedded, 20));
+        assert_eq!(text_at, embedded_at, "the embedded text sits where the attribute's text does");
+        seen.push(text_at);
+    }
+    seen.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    assert_eq!(seen, vec![(0.0, 2.0), (0.0, 7.0), (5.0, 2.0), (5.0, 7.0)]);
 }

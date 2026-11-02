@@ -57,11 +57,24 @@ fn stdout_failed(e: std::io::Error) {
 
 const USAGE: &str = "usage:
   cadcraft-cli info FILE.dxf
-  cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING]
-  cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
+  cadcraft-cli convert IN.dxf OUT.(dxf|dwg|svg|png|pdf) [FRAMING] [--keep-all]
+  cadcraft-cli info FILE --layouts   page setup + viewport fields of every layout (diagnostics)
+  cadcraft-cli convert IN.dxf OUT.pdf --layout NAME [--layout NAME2]... | --layout all | --layout sheets [--fit]
+                           plot paper-space layouts at their page setup (paper, scale, plot
+                           area); several layouts write OUT-<layout>.pdf each. `all` is the
+                           Model (when it has objects) and every layout, `sheets` every layout
+                           without the Model. --fit scales each layout's contents to fit its
+                           printable area instead.
+  cadcraft-cli run [FILE | --sample | --metric] [--keep-all] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT [--lazy] [--launch]]
   cadcraft-cli perf [N | FILE]
+  cadcraft-cli perf FILE --open [--keep-all]
+                           time the phases of opening FILE (DWG -> DXF text -> groups -> document),
+                           with the memory each one takes and the file's records by type
+  --keep-all               keep every object the file has, whatever the cost: a drawing otherwise
+                           keeps at most 10 000 DGN line-style objects (LS*), and a file saved
+                           from it lacks the rest (convert and --save warn on stderr)
   cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version
 
@@ -167,7 +180,11 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
-        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
+    });
+    cadcraft_engine::cmd::file::set_read_all(|b, name| cadcraft_io::read_all(b, name).map_err(|e| e.to_string()));
+    cadcraft_engine::cmd::file::set_write_noted(|d, name, o| {
+        cadcraft_io::write_with_warnings(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
@@ -180,7 +197,19 @@ fn install_io() {
 }
 
 fn open(s: &mut Session, path: &str) -> Result<(), String> {
-    s.execute("open", &json!({ "path": path })).map(|_| ()).map_err(|e| e.to_string())
+    open_keeping(s, path, false).map(|_| ())
+}
+
+/// Open `path`, keeping every object the file has when `keep_all` (`--keep-all`); OPEN's reply,
+/// whose `warnings` say what reading left out.
+fn open_keeping(s: &mut Session, path: &str, keep_all: bool) -> Result<Value, String> {
+    s.execute("open", &json!({ "path": path, "keepAll": keep_all })).map_err(|e| e.to_string())
+}
+
+/// Whether `path` names a drawing file (DXF or DWG), which a save writes the drawing to.
+fn is_drawing_output(path: &str) -> bool {
+    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "dxf" | "dwg")
 }
 
 #[derive(Clone, Copy)]
@@ -209,10 +238,64 @@ fn validate_options(command: &str, args: &[String], specs: &[OptionSpec]) -> Res
 }
 
 const NO_OPTIONS: &[OptionSpec] = &[];
+const PERF_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--open", takes_value: false }, OptionSpec { name: "--keep-all", takes_value: false }];
+const INFO_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--layouts", takes_value: false }];
 
-fn info(path: &str) -> Result<(), String> {
+/// `info FILE --layouts`: per-layout page setup and viewport fields, for diagnosing a sheet
+/// that plots at the wrong size or with empty viewports (no drawing content is printed).
+fn layouts_report(s: &Session) -> Result<Value, String> {
+    let d = s.doc().map_err(|e| e.to_string())?;
+    let layouts: Vec<Value> = d
+        .layouts
+        .iter()
+        .map(|l| {
+            let viewports: Vec<Value> = l
+                .entities
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    cadcraft_engine::doc::EntityKind::Viewport(v) => Some(json!({
+                        "id": v.id, "on": v.on, "center": v.center, "width": v.width, "height": v.height,
+                        "view_center": v.view_center, "view_height": v.view_height,
+                        "frozen_layers": v.frozen_layers, "clipped": v.clip.is_some(),
+                    })),
+                    _ => None,
+                })
+                .collect();
+            // The paper-space extents, without the sheet's own view (viewport id 1): what a plot
+            // of the layout's extents covers, to compare with the paper.
+            let ext = l.entities.iter().filter(|e| !matches!(&e.kind, cadcraft_engine::doc::EntityKind::Viewport(v) if v.id == 1)).fold(
+                Bounds2::EMPTY,
+                |mut b, e| {
+                    let eb = cadcraft_engine::doc::entity_bounds(d, e, 0);
+                    if !eb.is_empty() {
+                        b.add(eb.min);
+                        b.add(eb.max);
+                    }
+                    b
+                },
+            );
+            let extents = (!ext.is_empty()).then(|| json!([[ext.min.x, ext.min.y], [ext.max.x, ext.max.y]]));
+            // The plot style table the plot will apply: the page setup's, when it is a table the
+            // drawing has or a built-in one; otherwise objects plot in their own colours.
+            let table = &l.page.plot_style_table;
+            let plot_style = match cadcraft_engine::doc::plot_style_table(d, table) {
+                Some(t) => json!({ "name": t.name, "description": t.description, "colorDependent": t.is_color_dependent() }),
+                None if table.trim().is_empty() || table.trim().eq_ignore_ascii_case("none") => json!("none: object colours"),
+                None => json!(format!("`{table}` is not available: object colours")),
+            };
+            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "plotStyle": plot_style, "viewports": viewports })
+        })
+        .collect();
+    Ok(json!({ "layouts": layouts }))
+}
+
+fn info(path: &str, layouts: bool) -> Result<(), String> {
     let mut s = Session::empty();
     open(&mut s, path)?;
+    if layouts {
+        outln!("{}", serde_json::to_string_pretty(&layouts_report(&s)?).unwrap_or_default());
+        return Ok(());
+    }
     let v = s.execute("drawing.inspect", &json!({ "entities": false })).map_err(|e| e.to_string())?;
     outln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     Ok(())
@@ -224,9 +307,24 @@ fn export(s: &Session, out: &str) -> Result<(), String> {
 
 fn export_framed(s: &Session, out: &str, window: Option<Bounds2>) -> Result<(), String> {
     let d = s.doc().map_err(|e| e.to_string())?;
-    let bytes = cadcraft_io::write_framed(d, out, window).map_err(|e| e.to_string())?;
+    // Raster images with relative paths are found next to the drawing.
+    let dir = s.state().ok().and_then(|st| st.path.clone()).and_then(|f| std::path::Path::new(&f).parent().map(|p| p.to_string_lossy().into_owned()));
+    let dir = dir.map(|p| if p.is_empty() { ".".to_string() } else { p });
+    // A drawing file: written with what it lacks (a DWG read back and counted against the
+    // drawing); an image: framed.
+    let (bytes, lacks) = if is_drawing_output(out) {
+        cadcraft_io::write_with_warnings(d, out, &cadcraft_io::SaveOptions::default()).map_err(|e| e.to_string())?
+    } else {
+        (cadcraft_io::write_framed_from(d, out, window, dir).map_err(|e| e.to_string())?, Vec::new())
+    };
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
+    // A drawing file written lacks what reading the drawing left out, and what the writer did.
+    if is_drawing_output(out) {
+        for note in d.read_notes.iter().chain(&lacks) {
+            eprintln!("warning: {note}");
+        }
+    }
     if cadcraft_engine::cmd::file::drops_unknown(out) {
         let lost = cadcraft_engine::cmd::file::not_saved(d);
         if let Some(m) = cadcraft_engine::cmd::file::not_saved_message(&lost) {
@@ -259,24 +357,106 @@ fn check_framed_output(framing: Framing, out: Option<&str>) -> Result<(), String
     }
 }
 
+/// `--layout` checks: a PDF output and no model-space framing; `--fit` goes with it.
+fn check_layout_output(layouts: &[String], framing: Framing, out: &str, fit: bool) -> Result<(), String> {
+    if layouts.is_empty() {
+        if fit {
+            return Err("--fit only applies with --layout".into());
+        }
+        return Ok(());
+    }
+    if !out.to_ascii_lowercase().ends_with(".pdf") {
+        return Err(format!("--layout only applies to PDF output, not `{out}`"));
+    }
+    if framing != Framing::Auto {
+        return Err("--layout plots the layout's page setup; it cannot be combined with --window/--view".into());
+    }
+    Ok(())
+}
+
 fn convert(args: &[String]) -> Result<(), String> {
     let mut framing = Framing::Auto;
+    let mut layouts: Vec<String> = Vec::new();
+    let mut fit = false;
+    let mut keep_all = false;
     let mut files = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if !framing_option(a, &mut it, &mut framing)? {
+        if a == "--layout" {
+            layouts.push(it.next().ok_or("--layout needs a layout name (or `all`)")?.clone());
+        } else if a == "--fit" {
+            fit = true;
+        } else if a == "--keep-all" {
+            keep_all = true;
+        } else if !framing_option(a, &mut it, &mut framing)? {
             files.push(a);
         }
     }
     let [i, o] = files.as_slice() else { return Err(USAGE.into()) };
     check_framed_output(framing, Some(o))?;
+    check_layout_output(&layouts, framing, o, fit)?;
     let mut s = Session::empty();
-    open(&mut s, i)?;
+    open_keeping(&mut s, i, keep_all)?;
     if let Some(m) = skipped_message(s.doc().map_err(|e| e.to_string())?, i) {
         eprintln!("{m}");
     }
+    if !layouts.is_empty() {
+        return convert_layouts(&mut s, &layouts, o, fit);
+    }
     let window = export_window(&s, framing, None)?;
     export_framed(&s, o, window)
+}
+
+/// Plot layouts at their page setup (or, with `fit`, their contents fitted to the printable
+/// area). One layout writes `OUT.pdf`; several (or `all`) write `OUT-<layout>.pdf` each, as
+/// `publish` does.
+fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) -> Result<(), String> {
+    let with_fit = |mut q: Value| {
+        if fit {
+            q["fit"] = json!(true);
+        }
+        q
+    };
+    let group = |n: &str| n.eq_ignore_ascii_case("all") || n.eq_ignore_ascii_case("sheets");
+    if let [one] = layouts
+        && !group(one)
+    {
+        let r = s.execute("exportpdf", &with_fit(json!({ "path": out, "layout": one }))).map_err(|e| e.to_string())?;
+        eprintln!("wrote {out} ({} bytes, layout {one})", r["bytes"].as_u64().unwrap_or(0));
+        print_warnings(&r);
+        return Ok(());
+    }
+    if layouts.len() > 1 && layouts.iter().any(|l| group(l)) {
+        return Err("--layout all / sheets cannot be combined with layout names".into());
+    }
+    let mut q = json!({ "path": out });
+    if layouts[0].eq_ignore_ascii_case("sheets") {
+        // Every layout in tab order, without the Model.
+        let d = s.doc().map_err(|e| e.to_string())?;
+        let mut ls: Vec<&cadcraft_engine::doc::Layout> = d.layouts.iter().collect();
+        ls.sort_by_key(|l| l.tab_order);
+        q["layouts"] = json!(ls.iter().map(|l| l.name.clone()).collect::<Vec<_>>());
+    } else if !layouts[0].eq_ignore_ascii_case("all") {
+        q["layouts"] = json!(layouts);
+    }
+    let r = s.execute("publish", &with_fit(q)).map_err(|e| e.to_string())?;
+    for sheet in r["sheets"].as_array().into_iter().flatten() {
+        eprintln!(
+            "wrote {} ({} bytes, layout {})",
+            sheet["path"].as_str().unwrap_or("?"),
+            sheet["bytes"].as_u64().unwrap_or(0),
+            sheet["layout"].as_str().unwrap_or("?")
+        );
+        print_warnings(sheet);
+    }
+    Ok(())
+}
+
+/// The plot's warnings (a page that comes out blank, and what was done about it) on stderr.
+fn print_warnings(r: &Value) {
+    for w in r["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        eprintln!("warning: {w}");
+    }
 }
 
 /// The warning for the records of `path` the reader could not place, or `None` when there are none.
@@ -292,6 +472,7 @@ fn skipped_message(d: &cadcraft_engine::doc::Drawing, path: &str) -> Option<Stri
 
 fn run(args: &[String]) -> Result<(), String> {
     let mut s = Session::empty();
+    let keep_all = args.iter().any(|a| a == "--keep-all");
     let mut it = args.iter();
     let mut save = None;
     let mut exp: Option<String> = None;
@@ -316,7 +497,10 @@ fn run(args: &[String]) -> Result<(), String> {
             "--cmd" => steps.push(("cmd".into(), it.next().ok_or("--cmd needs `id {json}`")?.clone())),
             "--save" => save = Some(it.next().ok_or("--save needs a path")?.clone()),
             "--export" => exp = Some(it.next().ok_or("--export needs a path")?.clone()),
-            f if !f.starts_with("--") => open(&mut s, f)?,
+            "--keep-all" => {}
+            f if !f.starts_with("--") => {
+                open_keeping(&mut s, f, keep_all)?;
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -413,6 +597,158 @@ fn synthetic(n: usize, side: f64) -> Result<cadcraft_engine::doc::Drawing, Strin
     Ok(dr)
 }
 
+/// Resident and peak memory of this process, for `perf --open` (Linux; empty elsewhere).
+fn mem_line() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let kb = |key: &str| {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| s.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0)
+                / 1024
+        };
+        format!("memory {} MB (peak {} MB)", kb("VmRSS"), kb("VmHWM"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        String::new()
+    }
+}
+
+/// `perf FILE --open`: what each phase of opening the file costs, for a file that opens slowly
+/// or needs too much memory: the DWG read and its DXF rendition (acadrust), the groups, the
+/// sections, the records by type (count, groups, text, the largest record) and the document.
+/// The text is parsed once: the document is built from the sections the report looked at.
+fn perf_open(path: &str, keep_all: bool) -> Result<(), String> {
+    use cadcraft_dxf::Value as V;
+    use std::collections::HashMap;
+    use std::time::Instant;
+    let mb = |n: usize| n as f64 / 1048576.0;
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    outln!("{path}: {:.1} MB; {}", mb(bytes.len()), mem_line());
+    let t0 = Instant::now();
+    let mut from_dwg: Option<cadcraft_io::LeftOut> = None;
+    let dxf = if cadcraft_dwg::is_dwg(&bytes) {
+        let limits = if keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
+        let (dxf, notes, p) = cadcraft_dwg::dwg_to_dxf_probed(&bytes, limits)?;
+        outln!(
+            "dwg read (acadrust): {:.1} s; {} source records ({} decoded, {} skipped); {} entities, {} objects, {} table records; {} recovered errors, {} diagnostics",
+            p.read_secs,
+            p.source_records,
+            p.decoded_records,
+            p.skipped_records,
+            p.entities,
+            p.objects,
+            p.table_records,
+            p.recovered_errors,
+            p.diagnostics
+        );
+        outln!(
+            "dwg -> dxf text: {:.1} s; {:.1} MB ({:.1} x the DWG); header variables {:.2} s; {}",
+            p.write_secs,
+            mb(dxf.len()),
+            dxf.len() as f64 / bytes.len().max(1) as f64,
+            p.header_secs,
+            mem_line()
+        );
+        if let Some(l) = &p.dgn_line_styles {
+            for (k, n) in &l.objects {
+                outln!("  left out of the text: {n} {k}");
+            }
+            for (k, n) in &l.with_them {
+                outln!("  left out with them: {n} {k}");
+            }
+        }
+        from_dwg = cadcraft_io::left_out_from_dwg(&p, &cadcraft_io::ReadOptions { keep_all });
+        for n in &notes {
+            outln!("  note: {n}");
+        }
+        drop(bytes);
+        dxf
+    } else {
+        bytes
+    };
+    let t = Instant::now();
+    let options = cadcraft_io::ReadOptions { keep_all };
+    let (secs, outside, from_text) = cadcraft_io::dxf_sections_left_out(&dxf, &options).map_err(|e| e.to_string())?;
+    let left_out = from_dwg.unwrap_or(from_text);
+    let tags: usize = secs.iter().map(|s| s.tags.len()).sum();
+    outln!(
+        "dxf groups: {:.1} s; {} groups in {} sections ({:.0} MB as groups, plus their text), {} outside any section; {}",
+        t.elapsed().as_secs_f64(),
+        tags,
+        secs.len(),
+        mb(tags * std::mem::size_of::<cadcraft_dxf::Tag>()),
+        outside,
+        mem_line()
+    );
+    for (k, n) in &left_out.dgn_line_styles {
+        outln!("  stepped over: {n} {k}");
+    }
+    drop(dxf);
+    outln!("after dropping the text: {}", mem_line());
+    for s in &secs {
+        outln!("  section {:<10} {:>12} groups", s.name, s.tags.len());
+    }
+    // Records by type: count, groups, text bytes, the largest record.
+    let mut by_type: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    let (mut layers, mut blocks) = (0usize, 0usize);
+    for s in &secs {
+        for (kind, rec) in cadcraft_dxf::record_slices(&s.tags) {
+            let text: usize = rec
+                .iter()
+                .map(|t| match &t.value {
+                    V::Str(x) | V::Hex(x) => x.len(),
+                    _ => 0,
+                })
+                .sum();
+            let e = by_type.entry(format!("{}/{kind}", s.name)).or_default();
+            e.0 += 1;
+            e.1 += rec.len();
+            e.2 += text;
+            e.3 = e.3.max(rec.len());
+            match (s.name.as_str(), kind.as_str()) {
+                ("TABLES", "LAYER") => layers += 1,
+                ("BLOCKS", "BLOCK") => blocks += 1,
+                _ => {}
+            }
+        }
+    }
+    let mut rows: Vec<(&String, &(usize, usize, usize, usize))> = by_type.iter().collect();
+    rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+    outln!("records by type (the 20 with most groups; {layers} layers, {blocks} blocks):");
+    outln!("  {:<32} {:>10} {:>12} {:>9} {:>10}", "section/type", "records", "groups", "text MB", "largest");
+    for (k, (count, groups, text, largest)) in rows.iter().take(20) {
+        outln!("  {k:<32} {count:>10} {groups:>12} {:>9.1} {largest:>10}", mb(*text));
+    }
+    // The document, phase by phase: each phase's time and the memory when it started.
+    let t = Instant::now();
+    let mut phases: Vec<(&'static str, Instant, String)> = Vec::new();
+    let d = cadcraft_io::read_dxf_sections_left_out(secs, outside, &left_out, &mut |name| phases.push((name, Instant::now(), mem_line())))
+        .map_err(|e| e.to_string())?;
+    outln!(
+        "document: {:.1} s; {} entities, {} blocks, {} layers, {} layouts; {}",
+        t.elapsed().as_secs_f64(),
+        d.entity_count(),
+        d.blocks.len(),
+        d.layers.len(),
+        d.layouts.len(),
+        mem_line()
+    );
+    for (i, (name, start, mem)) in phases.iter().enumerate() {
+        let end = phases.get(i + 1).map_or(*start, |n| n.1);
+        if *name != "done" {
+            outln!("  {name:<18} {:>7.2} s; at start {mem}", end.duration_since(*start).as_secs_f64());
+        }
+    }
+    for n in &d.read_notes {
+        outln!("  note: {n}");
+    }
+    outln!("total: {:.1} s", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// `perf FILE`: the display list built as the canvas builds it (a 1600 x 1000 px view at the
 /// drawing's centre: tolerance, dash level of detail and view window from the zoom band), at
 /// zoom extents and zoomed in 4x at a time, next to the full-detail build plots use.
@@ -459,6 +795,10 @@ fn perf(args: &[String]) -> Result<(), String> {
     use cadcraft_engine::geom::{Bounds2, Vec2};
     use cadcraft_engine::{select, snap};
     use std::time::Instant;
+    if args.iter().any(|a| a == "--open") {
+        let path = args.iter().find(|a| !a.starts_with("--")).ok_or("perf --open needs a file")?;
+        return perf_open(path, args.iter().any(|a| a == "--keep-all"));
+    }
     if let Some(path) = args.first().filter(|a| a.parse::<usize>().is_err()) {
         return perf_file(path);
     }
@@ -646,10 +986,12 @@ fn cli() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
     let r = match args.first().map(String::as_str) {
-        Some("info") => validate_options("info", &rest, NO_OPTIONS).and_then(|_| rest.first().ok_or_else(|| USAGE.to_string())).and_then(|p| info(p)),
+        Some("info") => validate_options("info", &rest, INFO_OPTIONS)
+            .and_then(|_| rest.iter().find(|a| !a.starts_with("--")).ok_or_else(|| USAGE.to_string()))
+            .and_then(|p| info(p, rest.iter().any(|a| a == "--layouts"))),
         Some("convert") => convert(&rest),
         Some("run") => run(&rest),
-        Some("perf") => validate_options("perf", &rest, NO_OPTIONS).and_then(|_| perf(&rest)),
+        Some("perf") => validate_options("perf", &rest, PERF_OPTIONS).and_then(|_| perf(&rest)),
         Some("sample") => validate_options("sample", &rest, NO_OPTIONS).and_then(|_| sample(&rest)),
         Some("commands") => validate_options("commands", &rest, NO_OPTIONS).map(|_| {
             let s = Session::new();
@@ -832,6 +1174,217 @@ mod tests {
         let bad: Vec<String> = ["--sample", "--window", "0,0,NaN,1", "--export", &path("bad.png")].iter().map(|a| a.to_string()).collect();
         assert!(run(&bad).unwrap_err().contains("--window"));
         assert!(!dir.join("bad.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert_plots_named_layouts_to_pdf() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        run(&a(&["--sample", "--cmd", r#"layout.new {"name":"SHEET A"}"#, "--cmd", r#"layout.new {"name":"SHEET B"}"#, "--save", &path("in.dxf")]))
+            .unwrap();
+
+        // One layout: OUT.pdf itself.
+        convert(&a(&[&path("in.dxf"), &path("one.pdf"), "--layout", "SHEET A"])).unwrap();
+        assert!(std::fs::read(path("one.pdf")).unwrap().starts_with(b"%PDF"));
+
+        // Several: OUT-<layout>.pdf each, as publish names them.
+        convert(&a(&[&path("in.dxf"), &path("two.pdf"), "--layout", "SHEET A", "--layout", "SHEET B"])).unwrap();
+        for n in ["two-SHEET A.pdf", "two-SHEET B.pdf"] {
+            assert!(std::fs::read(path(n)).unwrap().starts_with(b"%PDF"), "{n}");
+        }
+
+        // `all`: Model (it has objects) and every layout, in tab order.
+        convert(&a(&[&path("in.dxf"), &path("all.pdf"), "--layout", "all"])).unwrap();
+        for n in ["all-Model.pdf", "all-SHEET A.pdf", "all-SHEET B.pdf"] {
+            assert!(dir.join(n).exists(), "{n}");
+        }
+        // `sheets`: every layout, without the Model.
+        convert(&a(&[&path("in.dxf"), &path("sh.pdf"), "--layout", "sheets"])).unwrap();
+        assert!(dir.join("sh-SHEET A.pdf").exists() && dir.join("sh-SHEET B.pdf").exists() && !dir.join("sh-Model.pdf").exists());
+        assert!(convert(&a(&[&path("in.dxf"), &path("x.pdf"), "--layout", "sheets", "--layout", "SHEET A"])).is_err());
+
+        // --fit goes with --layout.
+        convert(&a(&[&path("in.dxf"), &path("fit.pdf"), "--layout", "SHEET A", "--fit"])).unwrap();
+        assert!(std::fs::read(path("fit.pdf")).unwrap().starts_with(b"%PDF"));
+
+        // Misuse is an error and writes nothing.
+        let err = |v: &[&str]| convert(&a(v)).unwrap_err();
+        assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--fit"]).contains("--fit"));
+        assert!(err(&[&path("in.dxf"), &path("x.png"), "--layout", "SHEET A"]).contains("PDF"));
+        assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--layout", "SHEET A", "--view", "extents"]).contains("--window/--view"));
+        assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--layout", "all", "--layout", "SHEET A"]).contains("all"));
+        assert!(err(&[&path("in.dxf"), &path("x.pdf"), "--layout"]).contains("--layout needs"));
+        assert!(convert(&a(&[&path("in.dxf"), &path("x.pdf"), "--layout", "NOPE"])).is_err());
+        assert!(!dir.join("x.pdf").exists() && !dir.join("x.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert_layout_plots_viewport_content() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-layoutvp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        // Same drawing; SHEET B additionally gets a viewport showing the sample's model space.
+        run(&a(&[
+            "--sample",
+            "--cmd",
+            r#"layout.new {"name":"EMPTY"}"#,
+            "--cmd",
+            r#"layout.new {"name":"WITHVP"}"#,
+            "--cmd",
+            r#"mview {"layout":"WITHVP","p1":[10,10],"p2":[200,150]}"#,
+            "--save",
+            &path("in.dxf"),
+        ]))
+        .unwrap();
+        convert(&a(&[&path("in.dxf"), &path("e.pdf"), "--layout", "EMPTY"])).unwrap();
+        convert(&a(&[&path("in.dxf"), &path("v.pdf"), "--layout", "WITHVP"])).unwrap();
+        let (e, v) = (std::fs::read(path("e.pdf")).unwrap(), std::fs::read(path("v.pdf")).unwrap());
+        assert!(v.len() > e.len(), "viewport content missing: empty {} bytes, with viewport {} bytes", e.len(), v.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn info_layouts_reports_page_setup_and_viewports() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-infolayouts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("in.dxf").to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        run(&a(&["--sample", "--cmd", r#"layout.new {"name":"S"}"#, "--cmd", r#"mview {"layout":"S","p1":[10,10],"p2":[200,150]}"#, "--save", &f]))
+            .unwrap();
+        let mut s = Session::empty();
+        open(&mut s, &f).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = layouts_report(&s).unwrap();
+        let l = r["layouts"].as_array().unwrap().iter().find(|l| l["name"] == "S").unwrap();
+        assert!(!l["viewports"].as_array().unwrap().is_empty());
+        assert!(l["page"]["widthMm"].as_f64().unwrap() > 0.0);
+        assert!(l["extents"].as_array().is_some_and(|a| a.len() == 2), "paper-space extents: {l}");
+    }
+
+    #[test]
+    fn convert_layout_plots_a_dwg_on_the_same_page_as_its_dxf() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-layoutdwg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        run(&a(&[
+            "--sample",
+            "--cmd",
+            r#"layout.new {"name":"S"}"#,
+            "--cmd",
+            r#"mview {"layout":"S","p1":[10,10],"p2":[200,150]}"#,
+            "--save",
+            &path("in.dxf"),
+        ]))
+        .unwrap();
+        convert(&a(&[&path("in.dxf"), &path("in.dwg")])).unwrap();
+        convert(&a(&[&path("in.dxf"), &path("dxf.pdf"), "--layout", "S"])).unwrap();
+        convert(&a(&[&path("in.dwg"), &path("dwg.pdf"), "--layout", "S"])).unwrap();
+        let (x, w) = (std::fs::read(path("dxf.pdf")).unwrap(), std::fs::read(path("dwg.pdf")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        let media = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b);
+            let i = t.find("/MediaBox [").expect("media box");
+            t[i..i + 40].to_string()
+        };
+        assert_eq!(media(&x), media(&w), "the DWG plots on the layout's page");
+        assert!(w.len() > x.len() / 2 && w.len() < x.len() * 2, "dxf {} bytes, dwg {} bytes", x.len(), w.len());
+    }
+
+    #[test]
+    fn exportpdf_warns_when_the_window_lies_outside_the_drawing() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let mut drawing = cadcraft_engine::doc::Drawing::new_metric();
+        let name = drawing.layouts[0].name.clone();
+        {
+            let p = &mut drawing.layouts[0].page;
+            p.plot_area = "window".into();
+            p.window = Some(Bounds2::new(Vec2::new(1000.0, 1000.0), Vec2::new(1100.0, 1050.0)));
+            p.scale_to_fit = true;
+        }
+        let line = cadcraft_engine::doc::Line {
+            a: cadcraft_engine::geom::Vec3::new(10.0, 10.0, 0.0),
+            b: cadcraft_engine::geom::Vec3::new(200.0, 150.0, 0.0),
+        };
+        drawing.add(&Space::Paper(name.clone()), cadcraft_engine::doc::Common::default(), cadcraft_engine::doc::EntityKind::Line(line)).unwrap();
+        std::fs::write(path("w.dxf"), cadcraft_io::write_dxf(&drawing)).unwrap();
+        let mut s = Session::empty();
+        open(&mut s, &path("w.dxf")).unwrap();
+        let r = s.execute("exportpdf", &json!({ "path": path("w.pdf"), "layout": name })).unwrap();
+        let warning = r["warnings"][0].as_str().unwrap_or("").to_string();
+        assert!(warning.contains("window") && warning.contains("blank"), "{r}");
+        let r = s.execute("exportpdf", &json!({ "path": path("f.pdf"), "layout": name, "fit": true })).unwrap();
+        assert!(r["warnings"][0].as_str().unwrap_or("").contains("extents were plotted instead"), "{r}");
+        // The CLI path prints them and still writes the file.
+        convert(&a_(&[&path("w.dxf"), &path("c.pdf"), "--layout", &name, "--fit"])).unwrap();
+        assert!(std::fs::read(path("c.pdf")).unwrap().starts_with(b"%PDF"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn a_(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `convert` keeps every object the file has only with `--keep-all`: a file with more DGN
+    /// line-style objects than a drawing keeps is written without them otherwise (and warns).
+    #[test]
+    fn convert_keeps_every_object_only_when_asked() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-keep-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let n = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS + 1;
+        let mut dxf = String::from(
+            "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_DGNLINESTYLECOMP\n350\n200\n\
+             0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n",
+        );
+        for i in 0..n {
+            dxf += &format!("3\nLS_{i}\n360\n{:X}\n", 0x1000 + i);
+        }
+        for i in 0..n {
+            dxf += &format!("0\nLSINTERNALCOMPONENT\n5\n{:X}\n330\n200\n100\nAcDbLSInternalComponent\n1\nC{i}\n40\n1.0\n", 0x1000 + i);
+        }
+        dxf += "0\nENDSEC\n0\nEOF\n";
+        std::fs::write(path("in.dxf"), &dxf).unwrap();
+        let count = |n: &str| std::fs::read_to_string(path(n)).unwrap().lines().filter(|l| l.trim() == "LSINTERNALCOMPONENT").count();
+        convert(&a_(&[&path("in.dxf"), &path("lean.dxf")])).unwrap();
+        assert_eq!(count("lean.dxf"), 0);
+        convert(&a_(&[&path("in.dxf"), &path("all.dxf"), "--keep-all"])).unwrap();
+        assert_eq!(count("all.dxf"), n);
+        run(&a_(&[&path("in.dxf"), "--keep-all", "--save", &path("saved.dxf")])).unwrap();
+        assert_eq!(count("saved.dxf"), n);
+        // What OPEN says about it, which convert and --save print as warnings on stderr.
+        let mut s = Session::empty();
+        let r = open_keeping(&mut s, &path("in.dxf"), false).unwrap();
+        assert!(r["warnings"][0].as_str().unwrap_or("").starts_with(&format!("{n} DGN line-style objects were left out")), "{r}");
+        let r = open_keeping(&mut s, &path("in.dxf"), true).unwrap();
+        assert_eq!(r["warnings"], json!([]));
+    }
+
+    #[test]
+    fn perf_open_reports_the_phases_of_a_file() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-perfopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.dxf").to_string_lossy().to_string();
+        run(&a_(&["--sample", "--save", &f])).unwrap();
+        perf_open(&f, false).unwrap();
+        let g = dir.join("p.dwg").to_string_lossy().to_string();
+        convert(&a_(&[&f, &g])).unwrap();
+        perf_open(&g, false).unwrap();
+        assert!(perf_open(&dir.join("nope.dwg").to_string_lossy(), false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

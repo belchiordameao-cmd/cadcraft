@@ -41,3 +41,29 @@ fn saveas_to_an_image_keeps_the_drawing_unsaved_under_its_name() {
     assert_eq!(r["path"], json!(dxf.to_string_lossy()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A drawing file written lacks what reading the drawing left out (DGN line-style objects
+/// beyond the cap, records a damaged DWG lost): the save says so in `warnings`, as a plot does
+/// about its page, so hosts can show it. An image or PDF export says nothing.
+#[test]
+fn saving_a_drawing_file_warns_about_what_reading_left_out() {
+    set_io(IoHooks { read: |_, _| Err("no reader in this test".into()), write: |_, _| Ok(b"0\nEOF\n".to_vec()), plot: None });
+    let dir = std::env::temp_dir().join(format!("cadcraft-save-warns-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new();
+    s.cmdline("circle 0,0 5").unwrap();
+    std::sync::Arc::make_mut(&mut s.docs[s.active].doc).read_notes = vec!["12 things were left out".into()];
+    let r = s.execute("saveas", &json!({ "path": dir.join("a.dxf").to_string_lossy() })).unwrap();
+    assert_eq!(r["warnings"], json!(["12 things were left out"]));
+    assert!(s.log.iter().any(|l| l == "Warning: 12 things were left out"), "{:?}", s.log);
+    let r = s.execute("qsave", &json!({})).unwrap();
+    assert_eq!(r["warnings"], json!(["12 things were left out"]));
+    let r = s.execute("saveas", &json!({ "path": dir.join("a.dwg").to_string_lossy() })).unwrap();
+    assert_eq!(r["warnings"], json!(["12 things were left out"]));
+    let r = s.execute("saveas", &json!({ "path": dir.join("a.png").to_string_lossy() })).unwrap();
+    assert!(r.get("warnings").is_none(), "{r}");
+    // Nothing left out: the array is there and empty, like a plot's.
+    std::sync::Arc::make_mut(&mut s.docs[s.active].doc).read_notes.clear();
+    let r = s.execute("saveas", &json!({ "path": dir.join("b.dxf").to_string_lossy() })).unwrap();
+    assert_eq!(r["warnings"], json!([]));
+}
