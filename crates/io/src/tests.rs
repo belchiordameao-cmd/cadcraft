@@ -2228,6 +2228,136 @@ fn kept_xrecord_application_group_roundtrips_as_read() {
     assert!(!out.contains("291\n2"), "no handle may be written under a bool code");
 }
 
+// ---------- DGN line-style objects and the raw keeper's cost ----------
+
+/// A DXF whose named object dictionary owns a DGN line-style component dictionary of `n`
+/// internal components (the shape a DGN import leaves behind) and another dictionary holding
+/// one XRECORD; `header` adds a HEADER section (the DWG bridge wants one).
+fn dgn_line_style_dxf(n: usize, header: bool) -> String {
+    let mut s = String::new();
+    if header {
+        s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFFF\n0\nENDSEC\n";
+    }
+    s += "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n\
+3\nACAD_DGNLINESTYLECOMP\n350\n200\n3\nMY_DATA\n350\n201\n\
+0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n";
+    for i in 0..n {
+        s += &format!("3\nLS_{i}\n360\n{:X}\n", 0x1000 + i);
+    }
+    s += "0\nDICTIONARY\n5\n201\n330\nC\n100\nAcDbDictionary\n281\n1\n3\nK\n360\n202\n\
+0\nXRECORD\n5\n202\n330\n201\n100\nAcDbXrecord\n280\n1\n1\nkept\n";
+    for i in 0..n {
+        s += &format!(
+            "0\nLSINTERNALCOMPONENT\n5\n{:X}\n330\n200\n100\nAcDbLSInternalComponent\n1\nC{i}\n90\n2\n91\n1\n310\n00\n40\n1.0\n280\n0\n\
+             290\n0\n291\n0\n92\n0\n41\n0.0\n42\n0.0\n281\n0\n93\n0\n96\n1\n97\n0\n297\n0\n98\n0\n",
+            0x1000 + i
+        );
+    }
+    s += "0\nENDSEC\n0\nEOF\n";
+    s
+}
+
+/// Records of `kind` in DXF text.
+fn dxf_records(text: &str, kind: &str) -> usize {
+    dxf_groups(text, "0", kind)
+}
+
+/// Groups `code` / `value` in DXF text.
+fn dxf_groups(text: &str, code: &str, value: &str) -> usize {
+    text.lines().map(str::trim).collect::<Vec<_>>().chunks(2).filter(|p| *p == [code, value]).count()
+}
+
+/// DGN line-style objects (`LS*`) are kept raw up to `MAX_DGN_LINE_STYLE_OBJECTS` of them and
+/// written back; a file with more opens without any of them, says so in a note, and is saved
+/// without them and without the dictionary entries that named them.
+#[test]
+fn dgn_line_style_objects_are_kept_up_to_the_cap_and_left_out_beyond_it() {
+    let max = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS;
+    let d = read_dxf(dgn_line_style_dxf(max, false).as_bytes()).unwrap();
+    assert!(d.read_notes.is_empty(), "{:?}", d.read_notes);
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), max);
+    let out = write_dxf(&d);
+    assert_eq!(dxf_records(&out, "LSINTERNALCOMPONENT"), max);
+    assert_eq!(dxf_groups(&out, "3", "LS_0"), 1);
+
+    let d = read_dxf(dgn_line_style_dxf(max + 1, false).as_bytes()).unwrap();
+    assert_eq!(d.read_notes.len(), 1, "{:?}", d.read_notes);
+    let note = &d.read_notes[0];
+    let n = max + 1;
+    assert!(
+        note.starts_with(&format!("{n} DGN line-style objects were left out ({n} LSINTERNALCOMPONENT): a drawing keeps at most {max}.")),
+        "{note}"
+    );
+    assert!(note.ends_with("a file saved from it has no DGN line styles (their linetypes stay)."), "{note}");
+    assert!(d.foreign.objects.iter().all(|o| o.kind != "LSINTERNALCOMPONENT"));
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "XRECORD").count(), 1, "the rest is kept as before");
+    let out = write_dxf(&d);
+    assert_eq!(dxf_records(&out, "LSINTERNALCOMPONENT"), 0);
+    assert_eq!(dxf_groups(&out, "3", "LS_0"), 0, "an entry whose object is gone is dropped");
+    assert_eq!((dxf_groups(&out, "3", "ACAD_DGNLINESTYLECOMP"), dxf_groups(&out, "1", "kept")), (1, 1));
+}
+
+/// The same through a DWG: the objects go before the DXF text is written, so neither the text
+/// nor the groups carry them, and the note travels with the drawing's other DWG notes.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn dwg_with_more_dgn_line_styles_than_kept_opens_without_them() {
+    let max = cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS;
+    let dwg = cadcraft_dwg::dxf_to_dwg(dgn_line_style_dxf(max + 1, true).as_bytes()).unwrap();
+    let (dxf, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::DEFAULT).unwrap();
+    assert_eq!(probe.dgn_line_styles_left_out, vec![("LSINTERNALCOMPONENT".to_string(), max + 1)]);
+    assert_eq!(dxf_records(&String::from_utf8_lossy(&dxf), "LSINTERNALCOMPONENT"), 0);
+    assert!(notes.iter().any(|n| n.starts_with(&format!("{} DGN line-style objects were left out", max + 1))), "{notes:?}");
+    let d = read(&dwg, "dgn.dwg").unwrap();
+    assert!(d.read_notes.iter().any(|n| n.contains("DGN line-style objects were left out")), "{:?}", d.read_notes);
+    assert!(d.foreign.objects.iter().all(|o| o.kind != "LSINTERNALCOMPONENT"));
+
+    // Up to the cap they come through the DWG like any other object.
+    let dwg = cadcraft_dwg::dxf_to_dwg(dgn_line_style_dxf(5, true).as_bytes()).unwrap();
+    let (_, _, probe) = cadcraft_dwg::dwg_to_dxf_probed(&dwg, cadcraft_dwg::Limits::DEFAULT).unwrap();
+    assert!(probe.dgn_line_styles_left_out.is_empty());
+    let d = read(&dwg, "dgn.dwg").unwrap();
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), 5);
+}
+
+/// Building the drawing reports its phases in order, first to last.
+#[test]
+fn reading_phases_are_traced_in_order() {
+    let (secs, outside, notes) = crate::dxf_sections_noted(dgn_line_style_dxf(3, false).as_bytes()).unwrap();
+    assert!(notes.is_empty());
+    let mut seen: Vec<&'static str> = Vec::new();
+    let d = crate::read_dxf_sections_traced(secs, outside, &mut |p| seen.push(p)).unwrap();
+    assert_eq!(seen.first().copied(), Some("plot style names"));
+    assert_eq!(seen.last().copied(), Some("done"));
+    let at = |p: &str| seen.iter().position(|s| *s == p).unwrap_or_else(|| panic!("{p} not in {seen:?}"));
+    assert!(at("objects") < at("layouts and blocks") && at("layouts and blocks") < at("foreign data"));
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "LSINTERNALCOMPONENT").count(), 3);
+}
+
+/// Every object under one large dictionary is kept and written back. (The raw keeper read
+/// the dictionary's head again for each object it owned: with a dictionary of hundreds of
+/// thousands of entries that was quadratic, and a real file took minutes here.)
+#[test]
+fn objects_under_one_large_dictionary_are_all_kept() {
+    let n = 3000;
+    let mut s = String::from(
+        "0\nSECTION\n2\nOBJECTS\n0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nMY_APP\n350\n200\n\
+         0\nDICTIONARY\n5\n200\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n",
+    );
+    for i in 0..n {
+        s += &format!("3\nR{i}\n360\n{:X}\n", 0x1000 + i);
+    }
+    for i in 0..n {
+        s += &format!("0\nXRECORD\n5\n{:X}\n330\n200\n100\nAcDbXrecord\n280\n1\n1\nv{i}\n", 0x1000 + i);
+    }
+    s += "0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(s.as_bytes()).unwrap();
+    assert_eq!(d.foreign.objects.iter().filter(|o| o.kind == "XRECORD").count(), n);
+    let out = write_dxf(&d);
+    assert!(dxf_records(&out, "XRECORD") >= n, "{}", dxf_records(&out, "XRECORD"));
+    assert_eq!((dxf_groups(&out, "3", "R2999"), dxf_groups(&out, "1", "v2999")), (1, 1));
+}
+
 // ---------- plot transparency ----------
 
 /// A black line under a red solid at `percent` transparency (drawn after it, so on top).

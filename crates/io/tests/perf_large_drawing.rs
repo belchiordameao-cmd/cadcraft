@@ -133,3 +133,149 @@ fn open_and_plot_a_large_dwg() {
     let pdf = cadcraft_io::plot(&back, &Space::Model, &serde_json::json!({})).unwrap();
     eprintln!("plot Model: {:.1}s, {} KB, {}", t.elapsed().as_secs_f64(), pdf.len() / 1024, mem());
 }
+
+/// A DXF with the shape of a drawing imported from DGN: `n` DGN line-style components (`LS*`
+/// objects of about 90 groups each, a nineteenth of them stroke patterns) listed by one
+/// dictionary, 2400 definitions, 2400 linetypes, 3200 blocks of lines and 20 000 lines. A real
+/// 31 MB DWG had 288 000 of them, 26 million of its 29 million groups.
+fn dgn_profile_dxf(n: usize) -> String {
+    let strokes = n / 19;
+    let internal = n - strokes;
+    let mut s = String::with_capacity(n * 800);
+    s += "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1027\n9\n$HANDSEED\n5\nFFFFFFF\n9\n$MEASUREMENT\n70\n1\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n";
+    s += "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n5\n5\n330\n0\n100\nAcDbSymbolTable\n70\n2403\n";
+    for (name, h) in [("ByBlock", "14"), ("ByLayer", "15"), ("Continuous", "16")] {
+        s += &format!(
+            "0\nLTYPE\n5\n{h}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\n{name}\n70\n0\n3\n\n72\n65\n73\n0\n40\n0.0\n"
+        );
+    }
+    for i in 0..2400 {
+        s += &format!(
+            "0\nLTYPE\n5\n{:X}\n330\n5\n100\nAcDbSymbolTableRecord\n100\nAcDbLinetypeTableRecord\n2\nDGN_{i}\n70\n0\n3\n\n72\n65\n73\n2\n40\n1.5\n49\n1.0\n74\n0\n49\n-0.5\n74\n0\n",
+            0x100 + i
+        );
+    }
+    s += "0\nENDTAB\n0\nTABLE\n2\nLAYER\n5\n2\n330\n0\n100\nAcDbSymbolTable\n70\n1\n0\nLAYER\n5\n10\n330\n2\n100\nAcDbSymbolTableRecord\n100\nAcDbLayerTableRecord\n2\n0\n70\n0\n62\n7\n6\nContinuous\n0\nENDTAB\n";
+    s += "0\nTABLE\n2\nBLOCK_RECORD\n5\n1\n330\n0\n100\nAcDbSymbolTable\n70\n3202\n0\nBLOCK_RECORD\n5\n1F\n330\n1\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\n*Model_Space\n0\nBLOCK_RECORD\n5\n1B\n330\n1\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\n*Paper_Space\n";
+    for i in 0..3200 {
+        s += &format!("0\nBLOCK_RECORD\n5\n{:X}\n330\n1\n100\nAcDbSymbolTableRecord\n100\nAcDbBlockTableRecord\n2\nB{i}\n", 0x1000 + i);
+    }
+    s += "0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nBLOCKS\n";
+    let mut h = 0x10000u64;
+    let mut next = || {
+        h += 1;
+        format!("{h:X}")
+    };
+    for i in 0..3200 {
+        let br = format!("{:X}", 0x1000 + i);
+        s += &format!(
+            "0\nBLOCK\n5\n{}\n330\n{br}\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockBegin\n2\nB{i}\n70\n0\n10\n0.0\n20\n0.0\n30\n0.0\n3\nB{i}\n1\n\n",
+            next()
+        );
+        for k in 0..6 {
+            s += &format!(
+                "0\nLINE\n5\n{}\n330\n{br}\n100\nAcDbEntity\n8\n0\n100\nAcDbLine\n10\n{k}.0\n20\n0.0\n30\n0.0\n11\n{k}.0\n21\n1.0\n31\n0.0\n",
+                next()
+            );
+        }
+        s += &format!("0\nENDBLK\n5\n{}\n330\n{br}\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockEnd\n", next());
+    }
+    s += "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n";
+    for i in 0..20_000u64 {
+        let (x, y) = ((i * 7919 % 5000) as f64, (i * 104729 % 3000) as f64);
+        s += &format!(
+            "0\nLINE\n5\n{}\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbLine\n10\n{x}\n20\n{y}\n30\n0.0\n11\n{}\n21\n{}\n31\n0.0\n",
+            next(),
+            x + 10.0,
+            y + 5.0
+        );
+    }
+    s += "0\nENDSEC\n0\nSECTION\n2\nOBJECTS\n";
+    s += "0\nDICTIONARY\n5\nC\n330\n0\n100\nAcDbDictionary\n281\n1\n3\nACAD_DGNLINESTYLECOMP\n350\nD0\n3\nACAD_GROUP\n350\nD\n";
+    s += "0\nDICTIONARY\n5\nD\n330\nC\n100\nAcDbDictionary\n281\n1\n";
+    s += "0\nDICTIONARY\n5\nD0\n330\nC\n100\nAcDbDictionary\n280\n1\n281\n1\n";
+    let def = |i: usize| format!("{:X}", 0x2000_0000 + i);
+    let comp = |i: usize| format!("{:X}", 0x3000_0000 + i);
+    for i in 0..2400 {
+        s += &format!("3\nDGN_{i}\n360\n{}\n", def(i));
+    }
+    for i in 0..n {
+        s += &format!("3\n{{{i:08X}-0000-4000-8000-{i:012X}}}\n360\n{}\n", comp(i));
+    }
+    for i in 0..2400 {
+        s += &format!(
+            "0\nLSDEFINITION\n5\n{}\n102\n{{ACAD_REACTORS\n330\nD0\n102\n}}\n330\nD0\n100\nAcDbLSDefinition\n1\nDGN_{i}\n90\n2\n91\n{i}\n310\n{:032X}\n290\n0\n40\n1.0\n41\n1.0\n92\n0\n291\n0\n292\n1\n293\n0\n294\n1\n340\n{}\n",
+            def(i),
+            i,
+            comp(i % n.max(1))
+        );
+    }
+    let pattern = |strokes: usize| {
+        let mut p = format!("290\n0\n291\n0\n92\n0\n41\n0.0\n42\n0.0\n281\n0\n93\n{strokes}\n");
+        for k in 0..strokes {
+            p += &format!("292\n{}\n293\n0\n294\n1\n295\n0\n296\n0\n43\n{}.5\n44\n0.0\n45\n0.0\n94\n0\n95\n0\n", k % 2, k);
+        }
+        p
+    };
+    let (stroke_pattern, internal_pattern) = (pattern(4), pattern(7));
+    for i in 0..n {
+        let (kind, class, body, tail) = if i < strokes {
+            ("LSSTROKEPATTERNCOMPONENT", "AcDbLSStrokePatternComponent", &stroke_pattern, "")
+        } else {
+            ("LSINTERNALCOMPONENT", "AcDbLSInternalComponent", &internal_pattern, "96\n1\n97\n0\n297\n0\n98\n3\n")
+        };
+        s += &format!(
+            "0\n{kind}\n5\n{}\n102\n{{ACAD_REACTORS\n330\nD0\n102\n}}\n330\nD0\n100\n{class}\n1\nComponent {i}\n90\n2\n91\n1\n310\n{i:032X}\n40\n1.0\n280\n0\n{body}{tail}",
+            comp(i)
+        );
+    }
+    let _ = internal;
+    s += "0\nENDSEC\n0\nEOF\n";
+    s
+}
+
+/// How long a drawing full of DGN line-style objects takes to open, as DXF and (with
+/// `CADCRAFT_PERF_DGN_DWG=1`, through the DWG bridge, which takes a while to make the DWG) as
+/// DWG, with the memory it needs. `CADCRAFT_PERF_DGN` sets the number of objects (default
+/// 288 000, the real file's); `CADCRAFT_PERF_DGN_OUT` names a path to keep the DWG at.
+/// Measured on 02/11/2026 (release, 288 000 objects, a 223 MB DXF): before this round the
+/// drawing took 365 s and 3.1 GB to open (26 million groups kept, then the raw keeper reading
+/// the dictionary's head once per object); after, 2.6 s and 353 MB, the objects left out with a note.
+#[test]
+#[ignore]
+fn open_a_drawing_full_of_dgn_line_styles() {
+    let n: usize = std::env::var("CADCRAFT_PERF_DGN").ok().and_then(|v| v.parse().ok()).unwrap_or(288_000);
+    let t = Instant::now();
+    let dxf = dgn_profile_dxf(n);
+    eprintln!("DXF of {n} DGN line-style objects: {:.1}s, {} MB, {}", t.elapsed().as_secs_f64(), dxf.len() / 1048576, mem());
+    let t = Instant::now();
+    let d = cadcraft_io::read_dxf(dxf.as_bytes()).unwrap();
+    eprintln!(
+        "open DXF: {:.1}s, {} entities, {} blocks, {} kept objects, {}",
+        t.elapsed().as_secs_f64(),
+        d.model.len(),
+        d.blocks.len(),
+        d.foreign.objects.len(),
+        mem()
+    );
+    for note in &d.read_notes {
+        eprintln!("  note: {note}");
+    }
+    if std::env::var("CADCRAFT_PERF_DGN_DWG").is_ok_and(|v| v == "1") {
+        drop(d);
+        let t = Instant::now();
+        let dwg = cadcraft_dwg::dxf_to_dwg(dxf.as_bytes()).unwrap();
+        eprintln!("DWG through the bridge: {:.1}s, {} MB, {}", t.elapsed().as_secs_f64(), dwg.len() / 1048576, mem());
+        if let Ok(path) = std::env::var("CADCRAFT_PERF_DGN_OUT") {
+            std::fs::write(&path, &dwg).unwrap();
+            eprintln!("  kept at {path}");
+        }
+        drop(dxf);
+        let t = Instant::now();
+        let d = cadcraft_io::read(&dwg, "dgn.dwg").unwrap();
+        eprintln!("open DWG: {:.1}s, {} entities, {} kept objects, {}", t.elapsed().as_secs_f64(), d.model.len(), d.foreign.objects.len(), mem());
+        for note in &d.read_notes {
+            eprintln!("  note: {note}");
+        }
+    }
+}

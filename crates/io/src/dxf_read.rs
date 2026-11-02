@@ -1653,23 +1653,49 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
-    let (secs, outside) = sections_of(bytes)?;
-    read_sections(secs, outside)
+    let (secs, outside, notes) = sections_noted(bytes)?;
+    let mut d = read_sections(secs, outside)?;
+    d.read_notes.extend(notes);
+    Ok(d)
 }
 
-/// The sections of a DXF file's groups (the tags move into them: a large file's groups are held
-/// once) and the count of groups outside any section.
+/// The sections of a DXF file's groups (built as the groups are read: a large file's groups are
+/// held once) and the count of groups outside any section. [`sections_noted`] without its notes.
 pub fn sections_of(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)> {
-    let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
-    let outside = outside_sections(&tags);
-    Ok((cadcraft_dxf::into_sections(tags), outside))
+    sections_noted(bytes).map(|(secs, outside, _)| (secs, outside))
+}
+
+/// [`sections_of`] with the notes on what was left out: the DGN line-style objects of a file
+/// that has more than [`cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS`] (see there), which are
+/// stepped over as the text is parsed, so that no group is made for them. A file with fewer keeps
+/// them like any other object it has (they are read again, kept, when the first pass finds some).
+pub fn sections_noted(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize, Vec<String>)> {
+    let parse = |skip: &dyn Fn(&str) -> bool| cadcraft_dxf::parse_sections(bytes, skip).map_err(|e| IoError::Format(e.to_string()));
+    let p = parse(&cadcraft_dwg::is_dgn_line_style)?;
+    let n: usize = p.skipped.iter().map(|(_, c)| c).sum();
+    if n == 0 {
+        return Ok((p.sections, p.outside, Vec::new()));
+    }
+    if n <= cadcraft_dwg::MAX_DGN_LINE_STYLE_OBJECTS {
+        let p = parse(&|_| false)?;
+        return Ok((p.sections, p.outside, Vec::new()));
+    }
+    let note = cadcraft_dwg::dgn_line_style_note(&p.skipped);
+    Ok((p.sections, p.outside, vec![note]))
 }
 
 /// [`read`] from a file's sections ([`sections_of`]).
 pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result<Drawing> {
+    read_sections_traced(secs, outside, &mut |_| {})
+}
+
+/// [`read_sections`] telling `trace` the name of each phase as it starts, and `done` at the
+/// end, for `cadcraft-cli perf FILE --open` to time them.
+pub fn read_sections_traced(secs: Vec<cadcraft_dxf::Section>, outside: usize, trace: &mut dyn FnMut(&'static str)) -> Result<Drawing> {
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
+    trace("plot style names");
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
     let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
@@ -1682,6 +1708,7 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
     // a polyface mesh) would otherwise get handles that records further on still have. A file
     // CADCraft wrote names its own next handle, above which its rebuilt records are numbered
     // (#495), so it is left to that.
+    trace("handles");
     let ours = secs.iter().any(|s| s.name == "OBJECTS" && s.tags.iter().any(|t| t.code == 3 && t.str() == crate::dxf_ext::HANDSEED_KEY));
     for t in secs.iter().filter(|_| !ours).flat_map(|s| s.tags.iter()).filter(|t| t.code == 5 || t.code == 105) {
         if let Some(h) = Handle::parse_hex(t.str().trim()) {
@@ -1692,9 +1719,16 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
     count_skipped(&mut skipped, "(no section)", outside);
     for s in &secs {
         match s.name.as_str() {
-            "HEADER" => header(&s.tags, &mut d),
-            "TABLES" => tables(&s.tags, &mut d, &mut rx),
+            "HEADER" => {
+                trace("header");
+                header(&s.tags, &mut d);
+            }
+            "TABLES" => {
+                trace("tables");
+                tables(&s.tags, &mut d, &mut rx);
+            }
             "BLOCKS" => {
+                trace("blocks");
                 let recs = record_slices(&s.tags);
                 for (k, tg) in &recs {
                     let t = T(tg);
@@ -1732,11 +1766,13 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
             }
             // A damaged file may split its entities over several ENTITIES sections (#865).
             "ENTITIES" => {
+                trace("entities");
                 let mut n = 0;
                 entities.extend(parse_entities(&record_slices(&s.tags), &mut d, &mut rx, &mut n));
                 count_skipped(&mut skipped, "ENTITIES", n);
             }
             "OBJECTS" => {
+                trace("objects");
                 for (k, tg) in record_slices(&s.tags) {
                     objs.add(&k, tg);
                     if k == "LAYOUT" {
@@ -1760,6 +1796,7 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
             _ => {}
         }
     }
+    trace("layouts and blocks");
     // A file CADCraft wrote names its own next handle (#495): its table records and objects
     // are numbered above it and rebuilt on save, so following $HANDSEED would drift every save.
     let own_seed = objs.xrecord_text(crate::dxf_ext::HANDSEED_KEY).and_then(|t| Handle::parse_hex(t.trim()));
@@ -1834,6 +1871,7 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
         }
         d.blocks.insert(name, std::sync::Arc::new(b));
     }
+    trace("entities placed");
     // ENTITIES section: model space, or paper space when flagged (67=1).
     for (owner, paper, e) in entities {
         ensure(&mut d, &e.common.layer);
@@ -1848,9 +1886,13 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
             d.model.push(e);
         }
     }
+    trace("draw order");
     apply_sortents(&mut d, &objs.sortents, &rx.brs, &paper_block_for, &first_layout);
+    trace("objects applied");
     objs.apply(&mut d, &rx);
+    trace("images");
     crate::dxf_image::resolve(&secs, &mut d);
+    trace("multilines");
     crate::dxf_mline::resolve(&secs, &mut d);
     // Keep handles unique against the header's seed.
     let seed = d.header.str("HANDSEED", "");
@@ -1860,8 +1902,10 @@ pub fn read_sections(secs: Vec<cadcraft_dxf::Section>, outside: usize) -> Result
     if d.layer("0").is_none() {
         d.layers.insert(0, Layer::default());
     }
+    trace("foreign data");
     crate::dxf_raw::read(&secs, &mut d);
     d.skipped_records = skipped;
+    trace("done");
     Ok(d)
 }
 
@@ -1874,21 +1918,6 @@ fn count_skipped(skipped: &mut std::collections::BTreeMap<String, usize>, sectio
 
 /// Records between sections, which [`sections`] passes over: everything after an ENDSEC up to the
 /// next SECTION. Stray ENDSECs and the EOF hold nothing and don't count.
-fn outside_sections(tags: &[Tag]) -> usize {
-    let mut inside = false;
-    let mut n = 0usize;
-    for t in tags.iter().filter(|t| t.code == 0) {
-        match t.str().as_str() {
-            "SECTION" => inside = true,
-            "ENDSEC" => inside = false,
-            "EOF" => {}
-            _ if !inside => n = n.saturating_add(1),
-            _ => {}
-        }
-    }
-    n
-}
-
 /// A SORTENTSTABLE (DXF Reference, OBJECTS section): after its AcDbSortentsTable marker, the
 /// owning block record (330), then pairs of an entity handle (331) and the sort handle (5) it is
 /// drawn by.
