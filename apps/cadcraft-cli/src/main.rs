@@ -252,7 +252,15 @@ fn layouts_report(s: &Session) -> Result<Value, String> {
                 },
             );
             let extents = (!ext.is_empty()).then(|| json!([[ext.min.x, ext.min.y], [ext.max.x, ext.max.y]]));
-            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "viewports": viewports })
+            // The plot style table the plot will apply: the page setup's, when it is a table the
+            // drawing has or a built-in one; otherwise objects plot in their own colours.
+            let table = &l.page.plot_style_table;
+            let plot_style = match cadcraft_engine::doc::plot_style_table(d, table) {
+                Some(t) => json!({ "name": t.name, "description": t.description, "colorDependent": t.is_color_dependent() }),
+                None if table.trim().is_empty() || table.trim().eq_ignore_ascii_case("none") => json!("none: object colours"),
+                None => json!(format!("`{table}` is not available: object colours")),
+            };
+            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "plotStyle": plot_style, "viewports": viewports })
         })
         .collect();
     Ok(json!({ "layouts": layouts }))
