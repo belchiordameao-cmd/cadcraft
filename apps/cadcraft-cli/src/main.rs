@@ -235,7 +235,21 @@ fn layouts_report(s: &Session) -> Result<Value, String> {
                     _ => None,
                 })
                 .collect();
-            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "viewports": viewports })
+            // The paper-space extents, without the sheet's own view (viewport id 1): what a plot
+            // of the layout's extents covers, to compare with the paper.
+            let ext = l.entities.iter().filter(|e| !matches!(&e.kind, cadcraft_engine::doc::EntityKind::Viewport(v) if v.id == 1)).fold(
+                Bounds2::EMPTY,
+                |mut b, e| {
+                    let eb = cadcraft_engine::doc::entity_bounds(d, e, 0);
+                    if !eb.is_empty() {
+                        b.add(eb.min);
+                        b.add(eb.max);
+                    }
+                    b
+                },
+            );
+            let extents = (!ext.is_empty()).then(|| json!([[ext.min.x, ext.min.y], [ext.max.x, ext.max.y]]));
+            json!({ "name": l.name, "page": l.page, "entities": l.entities.iter().count(), "extents": extents, "viewports": viewports })
         })
         .collect();
     Ok(json!({ "layouts": layouts }))
@@ -1005,6 +1019,38 @@ mod tests {
         let l = r["layouts"].as_array().unwrap().iter().find(|l| l["name"] == "S").unwrap();
         assert!(!l["viewports"].as_array().unwrap().is_empty());
         assert!(l["page"]["widthMm"].as_f64().unwrap() > 0.0);
+        assert!(l["extents"].as_array().is_some_and(|a| a.len() == 2), "paper-space extents: {l}");
+    }
+
+    #[test]
+    fn convert_layout_plots_a_dwg_on_the_same_page_as_its_dxf() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-layoutdwg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        run(&a(&[
+            "--sample",
+            "--cmd",
+            r#"layout.new {"name":"S"}"#,
+            "--cmd",
+            r#"mview {"layout":"S","p1":[10,10],"p2":[200,150]}"#,
+            "--save",
+            &path("in.dxf"),
+        ]))
+        .unwrap();
+        convert(&a(&[&path("in.dxf"), &path("in.dwg")])).unwrap();
+        convert(&a(&[&path("in.dxf"), &path("dxf.pdf"), "--layout", "S"])).unwrap();
+        convert(&a(&[&path("in.dwg"), &path("dwg.pdf"), "--layout", "S"])).unwrap();
+        let (x, w) = (std::fs::read(path("dxf.pdf")).unwrap(), std::fs::read(path("dwg.pdf")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        let media = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b);
+            let i = t.find("/MediaBox [").expect("media box");
+            t[i..i + 40].to_string()
+        };
+        assert_eq!(media(&x), media(&w), "the DWG plots on the layout's page");
+        assert!(w.len() > x.len() / 2 && w.len() < x.len() * 2, "dxf {} bytes, dwg {} bytes", x.len(), w.len());
     }
 
     fn args(values: &[&str]) -> Vec<String> {
