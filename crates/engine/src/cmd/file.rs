@@ -88,6 +88,20 @@ pub type WriteAsHook = fn(&Drawing, &str, &SaveAs) -> std::result::Result<Vec<u8
 
 static WRITE_AS: OnceLock<WriteAsHook> = OnceLock::new();
 
+/// The host's reader that keeps every object a file has, whatever the cost (OPEN `keepAll`:
+/// the DGN line-style objects a drawing otherwise keeps a bounded number of).
+pub type ReadAllHook = fn(&[u8], &str) -> std::result::Result<Drawing, String>;
+static READ_ALL: OnceLock<ReadAllHook> = OnceLock::new();
+
+/// Install the host's keep-everything reader; without one, OPEN `keepAll` reports it is not
+/// available.
+pub fn set_read_all(h: ReadAllHook) {
+    let _ = READ_ALL.set(h);
+}
+pub fn read_all() -> Option<ReadAllHook> {
+    READ_ALL.get().copied()
+}
+
 /// Install the host's writer for [`SaveAs`] options; saves that ask for none use [`IoHooks::write`].
 pub fn set_write_as(h: WriteAsHook) {
     let _ = WRITE_AS.set(h);
@@ -160,7 +174,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("open", "Open...", run_open)
             .menu(&["File", "Open..."])
             .key("Cmd+O")
-            .params("{path} | {data: base64, name} → {index, entities?, warnings: what reading left out}")
+            .params("{path} | {data: base64, name} [keepAll: true keeps every object the file has, whatever the cost] → {index, entities?, warnings: what reading left out}")
             .enabled(always)
             .noundo(),
         CommandSpec::new("close", "Close", run_close).menu(&["File", "Close"]).key("Cmd+W").params("{index?}").noundo(),
@@ -266,7 +280,7 @@ pub fn read_file(path: &str) -> std::result::Result<ReadFile, String> {
     {
         let r = std::panic::catch_unwind(|| {
             let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
-            read_bytes(&bytes, path, Some(path.to_string()))
+            read_bytes(&bytes, path, Some(path.to_string()), false)
         });
         match r {
             Ok(r) => r.map_err(|e| e.to_string()),
@@ -288,9 +302,10 @@ pub fn finish_open(s: &mut Session, f: ReadFile) -> Result<Value> {
     Ok(opened(s, i, true))
 }
 
-fn read_bytes(bytes: &[u8], name: &str, path: Option<String>) -> Result<ReadFile> {
+fn read_bytes(bytes: &[u8], name: &str, path: Option<String>, keep_all: bool) -> Result<ReadFile> {
     let hooks = io().ok_or_else(|| bad("open", "file formats are not available in this build"))?;
-    let drawing = (hooks.read)(bytes, name).map_err(|e| bad("open", e))?;
+    let read = if keep_all { read_all().ok_or_else(|| bad("open", "keeping every object is not available in this build"))? } else { hooks.read };
+    let drawing = read(bytes, name).map_err(|e| bad("open", e))?;
     // A file that isn't a drawing (an imported SVG) gives the drawing no file name: QSAVE then
     // asks where to save instead of exporting over the original.
     let path = path.filter(|p| is_drawing_file(p));
@@ -310,8 +325,10 @@ fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, pat
     i
 }
 
-pub(crate) fn open_bytes(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>) -> Result<usize> {
-    let ReadFile { drawing, binary_dxf, name, path } = read_bytes(bytes, name, path)?;
+/// Open a file's bytes as a drawing, keeping every object the file has when `keep_all` (see
+/// [`set_read_all`]).
+pub(crate) fn open_bytes_keeping(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>, keep_all: bool) -> Result<usize> {
+    let ReadFile { drawing, binary_dxf, name, path } = read_bytes(bytes, name, path, keep_all)?;
     Ok(add_read(s, drawing, binary_dxf, &name, path))
 }
 
@@ -327,13 +344,14 @@ fn opened(s: &Session, i: usize, entities: bool) -> Value {
 }
 
 fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
+    let keep_all = p.get("keepAll").and_then(Value::as_bool).unwrap_or(false);
     if let Some(_path) = str_param(p, "path") {
         #[cfg(not(target_arch = "wasm32"))]
         let path = _path;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
-            let i = open_bytes(s, &bytes, path, Some(path.to_string()))?;
+            let i = open_bytes_keeping(s, &bytes, path, Some(path.to_string()), keep_all)?;
             super::blocks::xref::after_open(s, i);
             return Ok(opened(s, i, true));
         }
@@ -343,7 +361,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
     let data = str_param(p, "data").ok_or_else(|| bad("open", "`path` or `data` (base64) is required"))?;
     let bytes = base64_decode(data).ok_or_else(|| bad("open", "invalid base64"))?;
     let name = str_param(p, "name").unwrap_or("Drawing.dxf");
-    let i = open_bytes(s, &bytes, name, None)?;
+    let i = open_bytes_keeping(s, &bytes, name, None, keep_all)?;
     super::blocks::xref::after_open(s, i);
     Ok(opened(s, i, false))
 }
@@ -451,14 +469,23 @@ fn run_save(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.state()?.path.clone().ok_or_else(|| bad("qsave", "drawing has no file name yet; use saveas {path}"))?,
     };
     let n = save_to(s, &path)?;
-    Ok(saved(&path, n))
+    Ok(with_read_notes(s, &path, saved(&path, n)))
+}
+
+/// A drawing-file save's reply with `warnings`: what reading the drawing left out, which the
+/// file written lacks (as a plot's reply warns about its page).
+fn with_read_notes(s: &Session, path: &str, mut r: Value) -> Value {
+    if is_drawing_file(path) {
+        r["warnings"] = json!(s.doc().map(|d| d.read_notes.clone()).unwrap_or_default());
+    }
+    r
 }
 
 fn run_saveas(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("saveas", "`path` is required"))?.to_string();
     let opts = save_options("saveas", p)?;
     let n = save_as(s, "saveas", &path, &opts)?;
-    let mut r = saved(&path, n);
+    let mut r = with_read_notes(s, &path, saved(&path, n));
     if is_drawing_file(&path) {
         r["version"] = json!(opts.version.unwrap_or_else(|| drawing_version(s, &path)).year());
         r["binary"] = json!(opts.binary);
