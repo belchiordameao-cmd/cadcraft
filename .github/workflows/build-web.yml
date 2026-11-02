@@ -1,0 +1,31 @@
+name: build-web
+on:
+  push:
+    branches: [build-*]
+  workflow_dispatch:
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Trunk builds apps/cadcraft-web/index.html into dist/web (Trunk.toml): it fetches the
+      # matching wasm-bindgen and wasm-opt itself. The release binary avoids a 5-minute
+      # `cargo install trunk`.
+      - uses: jetli/trunk-action@v0.5.0
+        with:
+          version: "latest"
+      - name: build the web app
+        working-directory: apps/cadcraft-web
+        run: trunk build --release
+      - name: list what was built
+        run: ls -la dist/web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-web
+          path: dist/web
+          retention-days: 3
