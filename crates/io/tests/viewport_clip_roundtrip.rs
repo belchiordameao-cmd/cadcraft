@@ -115,3 +115,23 @@ fn hostile_clip_handles_do_not_panic() {
     g.remove(at);
     assert_eq!(viewport(&cadcraft_io::read_dxf(text_of(&g).as_bytes()).unwrap(), v).clip, None);
 }
+
+#[test]
+fn clip_boundary_survives_dwg() {
+    let (d, _, _) = drawing(false, true);
+    let dwg = cadcraft_io::write(&d, "t.dwg").unwrap();
+    let back = cadcraft_io::read(&dwg, "t.dwg").unwrap();
+    let sheet = Space::Paper(back.layouts[0].name.clone());
+    let vp = back
+        .space(&sheet)
+        .unwrap()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntityKind::Viewport(v) if v.id != 1 => Some(v.clone()),
+            _ => None,
+        })
+        .expect("viewport");
+    let b = vp.clip.expect("clip boundary kept through DWG");
+    assert!(matches!(back.entity(b).map(|e| &e.kind), Some(EntityKind::LwPolyline(p)) if p.closed && p.vertices.len() == 6));
+    assert!(vp.on);
+}

@@ -2417,6 +2417,36 @@ fn path_points(content: &str) -> Vec<Vec2> {
 }
 
 #[test]
+fn autocad_style_viewport_survives_dwg_view_target_frozen_331_no_xdata() {
+    // What AutoCAD 2004+ writes: 12/22 relative to the view target 17/27/37, frozen layers as
+    // 331 layer handles, no CADCraft xdata. Through DWG (acadrust) and back, the reader recovers
+    // the model point at the viewport's centre and the frozen layer names.
+    let (d, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    let mut rec: Vec<(String, String)> =
+        p[r.clone()].iter().take_while(|(c, _)| c != "1001").map(|(c, v)| (if c == "341" { "331".into() } else { c.clone() }, v.clone())).collect();
+    let at = rec.iter().position(|(c, _)| c == "45").unwrap() + 1;
+    rec.splice(at..at, [("17".to_string(), "1000.0".to_string()), ("27".to_string(), "-250.5".to_string()), ("37".to_string(), "0.0".to_string())]);
+    let mut q: Vec<(String, String)> = p[..r.start].to_vec();
+    q.extend(rec);
+    q.extend(p[r.end..].iter().cloned());
+    let dwg = cadcraft_dwg::dxf_to_dwg(join(&q).as_bytes()).unwrap();
+    let back = read(&dwg, "t.dwg").unwrap();
+    let center = |d: &Drawing| {
+        d.layouts
+            .iter()
+            .flat_map(|l| l.entities.iter())
+            .find_map(|e| match &e.kind {
+                EntityKind::Viewport(v) if v.id == 2 => Some(v.view_center),
+                _ => None,
+            })
+            .expect("viewport")
+    };
+    assert!(center(&back).near(center(&d) + Vec2::new(1000.0, -250.5), 1e-6), "{:?} vs {:?}", center(&back), center(&d));
+    assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
+}
+
+#[test]
 fn viewport_status_68_zero_reads_as_off() {
     // The DXF Reference: status 68 = 0 is a viewport that is off, whatever the flags say.
     let (_, p) = frozen_vp_dxf();
