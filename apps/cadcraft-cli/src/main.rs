@@ -619,6 +619,7 @@ fn perf_open(path: &str, keep_all: bool) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     outln!("{path}: {:.1} MB; {}", mb(bytes.len()), mem_line());
     let t0 = Instant::now();
+    let mut from_dwg: Option<cadcraft_io::LeftOut> = None;
     let dxf = if cadcraft_dwg::is_dwg(&bytes) {
         let limits = if keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
         let (dxf, notes, p) = cadcraft_dwg::dwg_to_dxf_probed(&bytes, limits)?;
@@ -642,12 +643,15 @@ fn perf_open(path: &str, keep_all: bool) -> Result<(), String> {
             p.header_secs,
             mem_line()
         );
-        for (k, n) in &p.dgn_line_styles_left_out {
-            outln!("  left out of the text: {n} {k}");
+        if let Some(l) = &p.dgn_line_styles {
+            for (k, n) in &l.objects {
+                outln!("  left out of the text: {n} {k}");
+            }
+            for (k, n) in &l.with_them {
+                outln!("  left out with them: {n} {k}");
+            }
         }
-        for (k, n) in &p.left_out_with_them {
-            outln!("  left out with them: {n} {k}");
-        }
+        from_dwg = cadcraft_io::left_out_from_dwg(&p, &cadcraft_io::ReadOptions { keep_all });
         for n in &notes {
             outln!("  note: {n}");
         }
@@ -658,7 +662,8 @@ fn perf_open(path: &str, keep_all: bool) -> Result<(), String> {
     };
     let t = Instant::now();
     let options = cadcraft_io::ReadOptions { keep_all };
-    let (secs, outside, left_out) = cadcraft_io::dxf_sections_left_out(&dxf, &options).map_err(|e| e.to_string())?;
+    let (secs, outside, from_text) = cadcraft_io::dxf_sections_left_out(&dxf, &options).map_err(|e| e.to_string())?;
+    let left_out = from_dwg.unwrap_or(from_text);
     let tags: usize = secs.iter().map(|s| s.tags.len()).sum();
     outln!(
         "dxf groups: {:.1} s; {} groups in {} sections ({:.0} MB as groups, plus their text), {} outside any section; {}",

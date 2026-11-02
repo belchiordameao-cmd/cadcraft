@@ -72,8 +72,12 @@ pub fn read_all(bytes: &[u8], name: &str) -> Result<Drawing> {
 pub fn read_with(bytes: &[u8], name: &str, o: &ReadOptions) -> Result<Drawing> {
     if cadcraft_dwg::is_dwg(bytes) {
         let limits = if o.keep_all { cadcraft_dwg::Limits::KEEPING_ALL } else { cadcraft_dwg::Limits::DEFAULT };
-        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, limits).map_err(IoError::Format)?;
-        let mut d = dxf_read::read_with(&dxf, o).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
+        let (dxf, notes, probe) = cadcraft_dwg::dwg_to_dxf_probed(bytes, limits).map_err(IoError::Format)?;
+        let converted = |e: IoError| IoError::Format(format!("{e} (in the DXF converted from this DWG)"));
+        let (secs, outside, from_text) = dxf_read::sections_left_out(&dxf, dxf_read::dgn_cap(o)).map_err(converted)?;
+        // What the bridge dropped before writing the text counts with what the text shows.
+        let left_out = dxf_read::left_out_from_dwg(&probe, limits.max_dgn_line_style_objects).unwrap_or(from_text);
+        let mut d = dxf_read::read_sections_left_out(secs, outside, &left_out, &mut |_| {}).map_err(converted)?;
         // The DWG's notes first, then what reading the DXF text left out.
         d.read_notes.splice(0..0, notes);
         return Ok(d);
@@ -212,6 +216,13 @@ pub fn dxf_sections(bytes: &[u8]) -> Result<(Vec<cadcraft_dxf::Section>, usize)>
 /// ([`LeftOut`]), for [`read_dxf_sections_left_out`].
 pub fn dxf_sections_left_out(bytes: &[u8], o: &ReadOptions) -> Result<(Vec<cadcraft_dxf::Section>, usize, LeftOut)> {
     dxf_read::sections_left_out(bytes, dxf_read::dgn_cap(o))
+}
+
+/// The account of what the DWG bridge left out of a DWG's DXF text, for
+/// [`read_dxf_sections_left_out`] (it carries what the text can no longer show); `None` when
+/// it left nothing out.
+pub fn left_out_from_dwg(probe: &cadcraft_dwg::DwgProbe, o: &ReadOptions) -> Option<LeftOut> {
+    dxf_read::left_out_from_dwg(probe, dxf_read::dgn_cap(o))
 }
 
 /// [`read_dxf`] from the sections [`dxf_sections`] split, so that a caller can look at the

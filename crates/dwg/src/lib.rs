@@ -62,11 +62,9 @@ pub struct DwgProbe {
     pub table_records: usize,
     pub recovered_errors: usize,
     pub diagnostics: usize,
-    /// DGN line-style objects left out before the DXF text was written, by type (none when
-    /// the file has at most [`Limits::max_dgn_line_style_objects`]).
-    pub dgn_line_styles_left_out: Vec<(String, usize)>,
-    /// The objects they owned, left out with them, by type.
-    pub left_out_with_them: Vec<(String, usize)>,
+    /// The DGN line-style objects left out before the DXF text was written, with what went
+    /// with them; `None` when the file has at most [`Limits::max_dgn_line_style_objects`].
+    pub dgn_line_styles: Option<DgnLineStylesLeftOut>,
 }
 
 /// A byte count in megabytes for messages ("9.9 MB", "1024 MB").
@@ -86,32 +84,52 @@ pub fn is_dgn_line_style(kind: &str) -> bool {
     )
 }
 
-/// What a file with more DGN line-style objects than kept loses: the objects by type, the
-/// objects they owned (an extension dictionary of a definition, say) by type, and the CLASS
-/// records of their types, which go with them.
+/// What a file with more DGN line-style objects than kept loses: the objects by type; the
+/// objects that go with them, by type (what they owned: a definition's extension dictionary
+/// and what it holds; and the extension dictionaries that held nothing but them, left empty);
+/// and the handles of all of these (upper-case hex), for the DXF reader to count what else the
+/// text shows as theirs: acadrust writes a dictionary whose owner is gone as owned by the root
+/// dictionary, and a dictionary without its entries, so the text alone no longer tells.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DgnLineStylesLeftOut {
     pub objects: Vec<(String, usize)>,
-    pub owned: Vec<(String, usize)>,
-    pub classes: usize,
+    pub with_them: Vec<(String, usize)>,
+    pub handles: std::collections::HashSet<String>,
+    /// The owners of the extension dictionaries left empty and gone (a DGN linetype's, which
+    /// held only its definition), by handle (upper-case hex): the DXF reader names their
+    /// record type in the note, as what loses its extension dictionary.
+    pub emptied_of: Vec<String>,
+    /// Those owners by record type, once the reader has resolved them (`LTYPE`, 14).
+    pub emptied: Vec<(String, usize)>,
 }
 
 impl DgnLineStylesLeftOut {
-    /// The note for the drawing's reader, `max` being the cap the file passed.
-    pub fn note(&self, max: usize) -> String {
+    /// The note for the drawing's reader: `classes` CLASS records of their types go with them,
+    /// `max` is the cap the file passed.
+    pub fn note(&self, classes: usize, max: usize) -> String {
         let n: usize = self.objects.iter().map(|(_, c)| c).sum();
         let list = |v: &[(String, usize)]| v.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(", ");
         let mut s = format!("{n} DGN line-style objects were left out ({})", list(&self.objects));
-        let m: usize = self.owned.iter().map(|(_, c)| c).sum();
+        let m: usize = self.with_them.iter().map(|(_, c)| c).sum();
         if m > 0 {
-            s += &format!(", with {m} {} they owned ({})", if m == 1 { "object" } else { "objects" }, list(&self.owned));
+            let e: usize = self.emptied.iter().map(|(_, c)| c).sum();
+            let losers = if e == 0 {
+                String::new()
+            } else {
+                let kinds = self.emptied.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(" and ");
+                format!(
+                    "; {kinds} {} extension {}",
+                    if e == 1 { "loses its" } else { "lose their" },
+                    if e == 1 { "dictionary" } else { "dictionaries" }
+                )
+            };
+            s += &format!(", with {m} {} that go with them ({}{losers})", if m == 1 { "object" } else { "objects" }, list(&self.with_them));
         }
-        if self.classes > 0 {
+        if classes > 0 {
             s += &format!(
-                "{} the {} CLASS {} of their types",
+                "{} the {classes} CLASS {} of their types",
                 if m > 0 { " and" } else { ", with" },
-                self.classes,
-                if self.classes == 1 { "record" } else { "records" }
+                if classes == 1 { "record" } else { "records" }
             );
         }
         s += &format!(
@@ -185,15 +203,12 @@ mod native {
             probe.recovered_errors = st.recovered_errors;
             probe.diagnostics = st.diagnostics.len();
         }
-        let mut notes = read_notes(&outcome.stats);
+        let notes = read_notes(&outcome.stats);
         let mut doc = outcome.document;
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
-        if let Some(left) = drop_dgn_line_styles(&mut doc, limits.max_dgn_line_style_objects) {
-            notes.push(left.note(limits.max_dgn_line_style_objects));
-            probe.dgn_line_styles_left_out = left.objects;
-            probe.left_out_with_them = left.owned;
-        }
+        // The DXF reader makes the note, with what the text still shows going with them.
+        probe.dgn_line_styles = drop_dgn_line_styles(&mut doc, limits.max_dgn_line_style_objects);
         let t = Instant::now();
         let mut out = CappedWriter { buf: Vec::new(), limit: limits.max_dxf_bytes, exceeded: false };
         let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
@@ -380,12 +395,12 @@ mod native {
     /// Leave the DGN line-style objects out of the DXF text when the file has more than `max`
     /// of them (see [`MAX_DGN_LINE_STYLE_OBJECTS`]): a DGN import leaves hundreds of thousands,
     /// each a tree of a hundred groups that nothing draws, and converting and reading them took
-    /// most of the time and memory of opening such a file. The objects they owned (an extension
-    /// dictionary of a definition, and what it owns in turn) go with them; acadrust's dictionary
-    /// writer leaves out the entries of objects that are gone, so the dictionary that listed
-    /// them is written without them; the CLASS records of their types stay in the text and are
-    /// counted, as the reader keeps a class only for objects it has. Returns what was left out,
-    /// or `None` when they are kept.
+    /// most of the time and memory of opening such a file. What they own goes with them: their
+    /// extension dictionaries (linked from the object, as the DWG reader may leave the
+    /// dictionary's own owner unset), what those hold, and every object whose owner is one of
+    /// them, followed down. acadrust's dictionary writer leaves out the entries of objects that
+    /// are gone, so the dictionary that listed them is written without them. Returns what was
+    /// left out, with every handle, or `None` when they are kept.
     fn drop_dgn_line_styles(doc: &mut acadrust::CadDocument, max: usize) -> Option<DgnLineStylesLeftOut> {
         use acadrust::objects::ObjectType;
         let name_of = |o: &ObjectType| -> Option<String> {
@@ -406,17 +421,67 @@ mod native {
         if objects.iter().map(|(_, n)| n).sum::<usize>() <= max {
             return None;
         }
-        // What they owned, following ownership down (bounded, as a damaged file can loop).
         let mut gone: std::collections::HashSet<acadrust::Handle> =
             doc.objects.iter().filter(|(_, o)| name_of(o).is_some()).map(|(h, _)| *h).collect();
         let mut owned: Vec<(String, usize)> = Vec::new();
+        let mut emptied_of: Vec<String> = Vec::new();
+        // Their extension dictionaries, by the link from the object.
+        let xdicts: Vec<acadrust::Handle> = doc
+            .objects
+            .values()
+            .filter_map(|o| match o {
+                ObjectType::DgnLineStyle(d) => d.xdictionary_handle,
+                _ => None,
+            })
+            .collect();
+        for h in xdicts {
+            if let Some(o) = doc.objects.get(&h)
+                && !gone.contains(&h)
+            {
+                gone.insert(h);
+                bump(&mut owned, type_name_of(o));
+            }
+        }
+        // What they own, by owner link and by dictionary entry, and the dictionaries left with
+        // no entry but theirs (an extension dictionary of a DGN linetype holding its definition:
+        // written empty, the reader drops it as empty), followed down; bounded, as a damaged
+        // file can loop. The root dictionary's own entries stay, empty or not.
+        let root_entries: std::collections::HashSet<acadrust::Handle> = {
+            let root = doc.header.named_objects_dict_handle;
+            doc.objects.get(&root).map(entries_of).unwrap_or_default().into_iter().collect()
+        };
         for _ in 0..64 {
-            let more: Vec<(acadrust::Handle, String)> = doc
+            let mut more: Vec<(acadrust::Handle, String)> = doc
                 .objects
                 .iter()
                 .filter(|(h, _)| !gone.contains(h))
                 .filter_map(|(h, o)| owner_of(o).filter(|ow| gone.contains(ow)).map(|_| (*h, type_name_of(o))))
                 .collect();
+            for (h, o) in &doc.objects {
+                if gone.contains(h) || more.iter().any(|(m, _)| m == h) {
+                    continue;
+                }
+                let entries = entries_of(o);
+                if !entries.is_empty() && !root_entries.contains(h) && entries.iter().all(|e| gone.contains(e)) {
+                    more.push((*h, type_name_of(o)));
+                    if let Some(owner) = owner_of(o).filter(|ow| !gone.contains(ow) && !ow.is_null()) {
+                        emptied_of.push(format!("{:X}", owner.value()));
+                    }
+                }
+            }
+            for (h, o) in &doc.objects {
+                if !gone.contains(h) {
+                    continue;
+                }
+                for e in entries_of(o) {
+                    if !gone.contains(&e)
+                        && !more.iter().any(|(m, _)| *m == e)
+                        && let Some(target) = doc.objects.get(&e)
+                    {
+                        more.push((e, type_name_of(target)));
+                    }
+                }
+            }
             if more.is_empty() {
                 break;
             }
@@ -428,11 +493,21 @@ mod native {
         doc.objects.retain(|h, _| !gone.contains(h));
         doc.dgn_ls_definitions.clear();
         doc.dgn_ls_components.clear();
-        let classes = doc.classes.iter().filter(|c| is_dgn_line_style(&c.dxf_name)).count();
         let by_count = |a: &(String, usize), b: &(String, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
         objects.sort_by(by_count);
         owned.sort_by(by_count);
-        Some(DgnLineStylesLeftOut { objects, owned, classes })
+        let handles = gone.iter().map(|h| format!("{:X}", h.value())).collect();
+        Some(DgnLineStylesLeftOut { objects, with_them: owned, handles, emptied_of, emptied: Vec::new() })
+    }
+
+    /// The objects a dictionary's entries name.
+    fn entries_of(o: &acadrust::objects::ObjectType) -> Vec<acadrust::Handle> {
+        use acadrust::objects::ObjectType as T;
+        match o {
+            T::Dictionary(d) => d.entries.iter().map(|(_, h)| *h).collect(),
+            T::DictionaryWithDefault(d) => d.entries.iter().map(|(_, h)| *h).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// An object's owner, for the kinds of object another object owns.
