@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use cadcraft_color::Color;
-use cadcraft_geom::{Vec2, Vec3};
+use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{EntityStore, Lineweight};
@@ -741,6 +741,13 @@ pub struct PageSetup {
     pub scale_to_fit: bool,
     /// Paper units per drawing unit.
     pub scale: f64,
+    /// Millimetres per paper-space unit of this layout, the page setup's plot paper units (DXF
+    /// group 72): 1 for millimetres, 25.4 for inches; 0 for the drawing's own units
+    /// ($MEASUREMENT), the default.
+    pub paper_unit_mm: f64,
+    /// The window plot area `window` plots, in paper-space units (DXF groups 48/49 and
+    /// 140/141); `None` when the page setup has none.
+    pub window: Option<Bounds2>,
     pub plot_style_table: String,
     pub center: bool,
     pub lineweights: bool,
@@ -764,6 +771,8 @@ impl Default for PageSetup {
             plot_area: "layout".into(),
             scale_to_fit: false,
             scale: 1.0,
+            paper_unit_mm: 0.0,
+            window: None,
             plot_style_table: String::new(),
             center: false,
             lineweights: true,

@@ -2529,3 +2529,172 @@ fn pdf_layout_plot_area_extents_fits_and_centres_the_sheet_contents() {
     let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
     assert!(near(b.min.x, -5.0 * k) && near(b.min.y, -5.0 * k) && near(b.max.x, 315.0 * k) && near(b.max.y, 225.0 * k), "{b:?}");
 }
+
+/// The pair range of the LAYOUT record named `name`.
+fn layout_record(p: &[(String, String)], name: &str) -> std::ops::Range<usize> {
+    let starts: Vec<usize> = (0..p.len()).filter(|&i| p[i].0 == "0").collect();
+    for w in starts.windows(2) {
+        let r = w[0]..w[1];
+        if p[w[0]].1 == "LAYOUT" && p[r.clone()].iter().any(|(c, v)| c == "1" && v == name) {
+            return r;
+        }
+    }
+    panic!("no LAYOUT {name}");
+}
+
+fn pairs_of(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.chunks(2).map(|c| (c[0].trim().to_string(), c.get(1).copied().unwrap_or("").to_string())).collect()
+}
+
+/// The `x y w h re` rectangles of an uncompressed PDF content stream.
+fn clip_rects(content: &str) -> Vec<[f64; 4]> {
+    let toks: Vec<&str> = content.split_whitespace().collect();
+    toks.windows(5)
+        .filter(|w| w[4] == "re")
+        .filter_map(|w| Some([w[0].parse().ok()?, w[1].parse().ok()?, w[2].parse().ok()?, w[3].parse().ok()?]))
+        .collect()
+}
+
+#[test]
+fn page_setup_paper_units_follow_the_plot_settings() {
+    // A metric drawing says millimetres (group 72 = 1) for its layouts; read back, the page
+    // setup keeps the drawing's units (its default).
+    let d = Drawing::new_metric();
+    let name = d.layouts[0].name.clone();
+    let mut p = pairs_of(&write_dxf(&d));
+    let r = layout_record(&p, &name);
+    assert!(p[r.clone()].contains(&("72".to_string(), "1".to_string())), "metric layouts plot in millimetres");
+    let back = read_dxf(join(&p).as_bytes()).unwrap();
+    assert_eq!(back.layout(&name).unwrap().page.paper_unit_mm, 0.0);
+    // The same layout plotting in inches (72 = 0): paper space is in inches, whatever
+    // $MEASUREMENT says. The sheet keeps its millimetre size, in inches.
+    for t in &mut p[r] {
+        if t.0 == "72" {
+            t.1 = "0".into();
+        }
+    }
+    let back = read_dxf(join(&p).as_bytes()).unwrap();
+    let page = back.layout(&name).unwrap().page.clone();
+    assert_eq!(page.paper_unit_mm, 25.4);
+    let sheet = cadcraft_render::paper::sheet(&back, &name).unwrap();
+    assert_eq!(sheet.unit_mm, 25.4);
+    let (w, h) = (page.width_mm.max(page.height_mm), page.width_mm.min(page.height_mm));
+    assert!((sheet.size.x - w / 25.4).abs() < 1e-9 && (sheet.size.y - h / 25.4).abs() < 1e-9, "{:?}", sheet.size);
+    // And it is written back as inches.
+    let again = pairs_of(&write_dxf(&back));
+    let r = layout_record(&again, &name);
+    assert!(again[r].contains(&("72".to_string(), "0".to_string())));
+    // A plot of it: a viewport drawn in inches at (1,1)..(9,7) spans 8 in = 576 pt, not 8 mm.
+    let mut back = back;
+    let paper = Space::Paper(name.clone());
+    back.add(
+        &paper,
+        Common::default(),
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id: 2,
+            ..Viewport::default()
+        }),
+    )
+    .unwrap();
+    let content = check_pdf(&plot(&back, &paper, &serde_json::json!({})).unwrap());
+    let pts = path_points(&content);
+    let (minx, maxx) = pts.iter().fold((f64::MAX, f64::MIN), |(a, b), q| (a.min(q.x), b.max(q.x)));
+    assert!((maxx - minx - 576.0).abs() < 0.05, "viewport border {minx}..{maxx} pt");
+}
+
+#[test]
+fn pdf_layout_plot_area_window_plots_the_window_to_fit() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    let window = Bounds2::new(Vec2::new(50.0, 50.0), Vec2::new(150.0, 100.0));
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "window".into();
+        p.window = Some(window);
+        p.scale_to_fit = true;
+        p.center = false;
+    }
+    // A frame around the sheet and a line inside the window.
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(0.0, 0.0), Vec2::new(287.0, 0.0), Vec2::new(287.0, 200.0), Vec2::new(0.0, 200.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    d.add(&paper, Common::default(), EntityKind::Line(Line { a: Vec3::new(60.0, 60.0, 0.0), b: Vec3::new(140.0, 90.0, 0.0) })).unwrap();
+    // The window survives a DXF round trip (groups 48/49 and 140/141).
+    let back = read_dxf(write_dxf(&d).as_bytes()).unwrap();
+    assert_eq!(back.layouts[0].page.window, Some(window));
+    assert_eq!(back.layouts[0].page.plot_area, "window");
+    // Scale to fit the 100 x 50 window into the 287 x 200 printable area: 2.87, from the
+    // printable corner (5 mm from the sheet's). The line's ends land accordingly.
+    let k = 72.0 / 25.4;
+    let s: f64 = 2.87;
+    let content = check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap());
+    let pts = path_points(&content);
+    let near = |p: &Vec2, x: f64, y: f64| (p.x - x).abs() < 0.05 && (p.y - y).abs() < 0.05;
+    assert!(pts.iter().any(|p| near(p, (5.0 + 10.0 * s) * k, (5.0 + 10.0 * s) * k)), "line start: {pts:?}");
+    assert!(pts.iter().any(|p| near(p, (5.0 + 90.0 * s) * k, (5.0 + 40.0 * s) * k)), "line end");
+    // The plot is clipped to the window: its page rectangle (5..292 x 5..148.5 mm).
+    let rects = clip_rects(&content);
+    let want = [5.0 * k, 5.0 * k, 287.0 * k, 143.5 * k];
+    assert!(rects.iter().any(|r| r.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.05)), "window clip: {rects:?}");
+}
+
+#[test]
+fn pdf_layout_fit_option_fits_the_contents_whatever_the_page_setup_says() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    {
+        let p = &mut d.layouts[0].page;
+        p.width_mm = 210.0;
+        p.height_mm = 297.0;
+        p.margins_mm = [5.0; 4];
+        p.landscape = true;
+        p.plot_area = "layout".into();
+    }
+    // A frame larger than the paper, in a layout whose page setup plots the sheet 1:1.
+    let frame = cadcraft_doc::LwPolyline {
+        vertices: [Vec2::new(-10.0, -10.0), Vec2::new(310.0, -10.0), Vec2::new(310.0, 220.0), Vec2::new(-10.0, 220.0)]
+            .into_iter()
+            .map(cadcraft_geom::PolyVertex::new)
+            .collect(),
+        closed: true,
+        const_width: 0.0,
+        elevation: 0.0,
+        plinegen: false,
+    };
+    d.add(&paper, Common::default(), EntityKind::LwPolyline(frame)).unwrap();
+    let extent = |content: &str| {
+        path_points(content).iter().fold(Bounds2::EMPTY, |mut b, p| {
+            b.add(*p);
+            b
+        })
+    };
+    let k = 72.0 / 25.4;
+    // As the page setup says: the sheet, 1:1, the frame overflowing it.
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({})).unwrap()));
+    assert!((b.max.x - 315.0 * k).abs() < 0.05, "{b:?}");
+    // With `fit`: the frame scaled by 200/230 and centred on the printable area.
+    let b = extent(&check_pdf(&plot(&d, &paper, &serde_json::json!({"fit": true})).unwrap()));
+    let s = 200.0 / 230.0;
+    let (cx, cy) = ((5.0 + 143.5) * k, (5.0 + 100.0) * k);
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+    assert!(near(b.min.x, cx - 160.0 * s * k) && near(b.max.x, cx + 160.0 * s * k), "{b:?}");
+    assert!(near(b.min.y, cy - 115.0 * s * k) && near(b.max.y, cy + 115.0 * s * k), "{b:?}");
+}

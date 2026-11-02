@@ -2377,6 +2377,8 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             "window" => 4,
             _ => 5,
         };
+        let unit_mm = cadcraft_render::paper::page_unit_mm(d, page);
+        let win = page.window.filter(|w| !w.is_empty() && w.min.is_finite() && w.max.is_finite());
         w.s(0, "LAYOUT");
         w.s(5, h);
         w.s(330, layout_dict.clone());
@@ -2395,17 +2397,18 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             (45, page.height_mm),
             (46, 0.0),
             (47, 0.0),
-            (48, 0.0),
-            (49, 0.0),
-            (140, 0.0),
-            (141, 0.0),
+            (48, win.map_or(0.0, |w| w.min.x)),
+            (49, win.map_or(0.0, |w| w.min.y)),
+            (140, win.map_or(0.0, |w| w.max.x)),
+            (141, win.map_or(0.0, |w| w.max.y)),
             (142, scale),
             (143, 1.0),
         ] {
             w.f(c, v);
         }
         w.i(70, plot_flags);
-        w.i(72, 0);
+        // Plot paper units: 1 millimetres, 0 inches.
+        w.i(72, i64::from(unit_mm == 1.0));
         w.i(73, i64::from(page.landscape));
         w.i(74, plot_type);
         w.s(7, &page.plot_style_table);

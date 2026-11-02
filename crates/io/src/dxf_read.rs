@@ -1391,14 +1391,14 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
         .iter()
         .filter(|(k, _)| k == "STYLE")
         .filter_map(|(_, tg)| {
-            let t = T(tg);
+            let t = T(&tg);
             let name = t.s(2).filter(|n| !n.trim().is_empty());
             Some((t.s(5)?.trim().to_ascii_uppercase(), name.or_else(|| t.s(3))?))
         })
         .collect();
     // Handle maps first: DIMSTYLE records refer to text styles and arrow blocks by handle.
     for (kind, tg) in &recs {
-        let t = T(tg);
+        let t = T(&tg);
         let (Some(h), Some(n)) = (t.s(5), t.s(2)) else { continue };
         match kind.as_str() {
             "STYLE" => {
@@ -1407,7 +1407,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             "BLOCK_RECORD" => {
                 let units = t.i(70).and_then(|u| u8::try_from(u).ok()).unwrap_or(0);
                 rx.block_props.insert(n.to_ascii_uppercase(), (units, t.i(280).unwrap_or(1) != 0));
-                if let Some(a) = crate::dxf_ext::read_array(tg) {
+                if let Some(a) = crate::dxf_ext::read_array(&tg) {
                     rx.block_arrays.insert(n.to_ascii_uppercase(), a);
                 }
                 rx.brs.insert(h.trim().to_ascii_uppercase(), n);
@@ -1735,7 +1735,13 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         // LAYOUT has two 330s: owner dict and the block record; take the last.
                         let br = tg.iter().rfind(|x| x.code == 330).map(Tag::str).unwrap_or_default();
                         let plot = T(tg.get(..start).unwrap_or(&[]));
-                        layout_objs.push((t.s(1).unwrap_or_default(), t.i(71).unwrap_or(0) as u32, br.to_ascii_uppercase(), page_setup(&plot)));
+                        let drawing_unit_mm = if d.header.i64("MEASUREMENT", 0) == 1 { 1.0 } else { 25.4 };
+                        layout_objs.push((
+                            t.s(1).unwrap_or_default(),
+                            t.i(71).unwrap_or(0) as u32,
+                            br.to_ascii_uppercase(),
+                            page_setup(&plot, drawing_unit_mm),
+                        ));
                     }
                 }
             }
@@ -2186,8 +2192,27 @@ fn infer_snap(d: &Drawing, osnap: i64, main: Handle, other: Option<Handle>, at: 
 }
 
 /// Page setup from a LAYOUT object's AcDbPlotSettings fields (sizes and margins in mm).
-fn page_setup(t: &T) -> PageSetup {
+/// `drawing_unit_mm` is the drawing's paper unit ($MEASUREMENT), which the plot paper units
+/// (72) override when they differ.
+fn page_setup(t: &T, drawing_unit_mm: f64) -> PageSetup {
     let mut p = PageSetup::default();
+    // Plot paper units: 0 inches, 1 millimetres (2, pixels, is left to the drawing's units).
+    let unit = match t.i(72) {
+        Some(0) => 25.4,
+        Some(1) => 1.0,
+        _ => drawing_unit_mm,
+    };
+    if (unit - drawing_unit_mm).abs() > 1e-9 {
+        p.paper_unit_mm = unit;
+    }
+    // The plot window (48/49 lower-left, 140/141 upper-right), in paper-space units.
+    let win = |c: i32| t.f(c).filter(|v| v.is_finite() && v.abs() <= 1e12);
+    if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (win(48), win(49), win(140), win(141)) {
+        let w = cadcraft_geom::Bounds2::new(Vec2::new(x0.min(x1), y0.min(y1)), Vec2::new(x0.max(x1), y0.max(y1)));
+        if w.width() > 0.0 && w.height() > 0.0 {
+            p.window = Some(w);
+        }
+    }
     let mm = |code: i32, d: f64| {
         let v = t.fd(code, d);
         if v.is_finite() && (0.0..=100_000.0).contains(&v) { v } else { d }
