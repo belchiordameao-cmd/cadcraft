@@ -9,8 +9,8 @@ use cadcraft_engine::cmd::plotters::{PlotterStore, set_plotter_store};
 use serde_json::{Value, json};
 
 /// The plot hook echoes the options it gets.
-fn echo_plot(_: &Drawing, _: &Space, opts: &Value) -> Result<Vec<u8>, String> {
-    Ok(opts.to_string().into_bytes())
+fn echo_plot(_: &Drawing, _: &Space, opts: &Value) -> Result<(Vec<u8>, Vec<String>), String> {
+    Ok((opts.to_string().into_bytes(), Vec::new()))
 }
 
 fn session() -> Session {

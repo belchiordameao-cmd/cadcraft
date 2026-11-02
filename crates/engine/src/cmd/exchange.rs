@@ -550,9 +550,9 @@ mod tests {
     use super::super::file::{IoHooks, set_io};
     use super::*;
 
-    fn fake_plot(_: &Drawing, space: &Space, opts: &Value) -> std::result::Result<Vec<u8>, String> {
+    fn fake_plot(_: &Drawing, space: &Space, opts: &Value) -> std::result::Result<(Vec<u8>, Vec<String>), String> {
         // Same output as the layout tests' stand-in: whichever test installs first wins.
-        Ok(format!("%PDF-1.4 fake {space:?} {opts}").into_bytes())
+        Ok((format!("%PDF-1.4 fake {space:?} {opts}").into_bytes(), Vec::new()))
     }
 
     /// Install stand-in io hooks; true when they are the ones installed (the hooks are

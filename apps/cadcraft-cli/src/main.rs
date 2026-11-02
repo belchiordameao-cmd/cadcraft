@@ -176,7 +176,7 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
-        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot_with_warnings(d, space, opts).map_err(|e| e.to_string())),
     });
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
@@ -388,6 +388,7 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) ->
     {
         let r = s.execute("exportpdf", &with_fit(json!({ "path": out, "layout": one }))).map_err(|e| e.to_string())?;
         eprintln!("wrote {out} ({} bytes, layout {one})", r["bytes"].as_u64().unwrap_or(0));
+        print_warnings(&r);
         return Ok(());
     }
     if layouts.len() > 1 && layouts.iter().any(|l| group(l)) {
@@ -411,8 +412,16 @@ fn convert_layouts(s: &mut Session, layouts: &[String], out: &str, fit: bool) ->
             sheet["bytes"].as_u64().unwrap_or(0),
             sheet["layout"].as_str().unwrap_or("?")
         );
+        print_warnings(sheet);
     }
     Ok(())
+}
+
+/// The plot's warnings (a page that comes out blank, and what was done about it) on stderr.
+fn print_warnings(r: &Value) {
+    for w in r["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        eprintln!("warning: {w}");
+    }
 }
 
 /// The warning for the records of `path` the reader could not place, or `None` when there are none.
@@ -1222,6 +1231,39 @@ mod tests {
         };
         assert_eq!(media(&x), media(&w), "the DWG plots on the layout's page");
         assert!(w.len() > x.len() / 2 && w.len() < x.len() * 2, "dxf {} bytes, dwg {} bytes", x.len(), w.len());
+    }
+
+    #[test]
+    fn exportpdf_warns_when_the_window_lies_outside_the_drawing() {
+        install_io();
+        let dir = std::env::temp_dir().join(format!("cadcraft-cli-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let mut drawing = cadcraft_engine::doc::Drawing::new_metric();
+        let name = drawing.layouts[0].name.clone();
+        {
+            let p = &mut drawing.layouts[0].page;
+            p.plot_area = "window".into();
+            p.window = Some(Bounds2::new(Vec2::new(1000.0, 1000.0), Vec2::new(1100.0, 1050.0)));
+            p.scale_to_fit = true;
+        }
+        let line = cadcraft_engine::doc::Line {
+            a: cadcraft_engine::geom::Vec3::new(10.0, 10.0, 0.0),
+            b: cadcraft_engine::geom::Vec3::new(200.0, 150.0, 0.0),
+        };
+        drawing.add(&Space::Paper(name.clone()), cadcraft_engine::doc::Common::default(), cadcraft_engine::doc::EntityKind::Line(line)).unwrap();
+        std::fs::write(path("w.dxf"), cadcraft_io::write_dxf(&drawing)).unwrap();
+        let mut s = Session::empty();
+        open(&mut s, &path("w.dxf")).unwrap();
+        let r = s.execute("exportpdf", &json!({ "path": path("w.pdf"), "layout": name })).unwrap();
+        let warning = r["warnings"][0].as_str().unwrap_or("").to_string();
+        assert!(warning.contains("window") && warning.contains("blank"), "{r}");
+        let r = s.execute("exportpdf", &json!({ "path": path("f.pdf"), "layout": name, "fit": true })).unwrap();
+        assert!(r["warnings"][0].as_str().unwrap_or("").contains("extents were plotted instead"), "{r}");
+        // The CLI path prints them and still writes the file.
+        convert(&a_(&[&path("w.dxf"), &path("c.pdf"), "--layout", &name, "--fit"])).unwrap();
+        assert!(std::fs::read(path("c.pdf")).unwrap().starts_with(b"%PDF"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn a_(v: &[&str]) -> Vec<String> {

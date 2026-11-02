@@ -17,8 +17,10 @@ use crate::{Accept, Input, Prompt, Result, Session, Step};
 pub(crate) use pgp::{specs as alias_specs, user_alias};
 pub use template::{qnew_template, set_qnew_template};
 
-/// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`).
-pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
+/// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`),
+/// with the plot's warnings (a page that comes out blank because its page setup's window or its
+/// objects lie elsewhere, and what was done about it).
+pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<(Vec<u8>, Vec<String>), String>;
 
 /// File format hooks (installed by the app so the engine stays I/O-agnostic and wasm-safe).
 pub struct IoHooks {
