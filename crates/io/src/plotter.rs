@@ -234,6 +234,17 @@ mod tests {
     }
 
     #[test]
+    fn model_space_pdf_plot_honours_device_margins() {
+        let d = drawing();
+        let model = Space::Model;
+        let none = plot(&d, &model, &json!({"width": 210, "height": 297})).unwrap();
+        let wide = plot(&d, &model, &json!({"width": 210, "height": 297, "margins": [30, 30, 30, 30]})).unwrap();
+        assert_ne!(none, wide, "device margins change a model-space PDF plot");
+        assert_eq!(wide, plot(&d, &model, &json!({"width": 210, "height": 297, "margins": [30, 30, 30, 30]})).unwrap());
+        assert!(plot(&d, &model, &json!({"margins": [-1, 0, 0, 0]})).is_ok(), "hostile margins are ignored, not fatal");
+    }
+
+    #[test]
     fn invalid_and_unsupported_plot_offsets_are_reported() {
         let d = drawing();
         let model = Space::Model;
